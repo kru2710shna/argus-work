@@ -1,0 +1,83 @@
+##### INFERENCE
+
+if(CUDA_ENABLED)
+    add_executable(RUN_INFERENCE run_inference.cpp)
+    target_link_libraries(RUN_INFERENCE
+        PRIVATE
+        PAYLOAD_LIB
+    )
+endif()
+
+##### BATCH OPTIMIZATION
+
+add_executable(RUN_OD_ON_DATASET run_od_on_dataset.cpp)
+target_link_libraries(RUN_OD_ON_DATASET
+    PRIVATE
+    spdlog::spdlog
+    PAYLOAD_LIB
+    Eigen3::Eigen
+    CLI11::CLI11
+)
+
+add_executable(RUN_OD_PIPELINE run_od_pipeline.cpp)
+target_link_libraries(RUN_OD_PIPELINE
+    PRIVATE
+    spdlog::spdlog
+    PAYLOAD_LIB
+    CLI11::CLI11
+)
+
+##### DATASETS
+
+add_executable(run_dataset
+    run_dataset.cpp
+)
+target_link_libraries(run_dataset
+    PRIVATE
+    spdlog::spdlog
+    PAYLOAD_LIB
+    CLI11::CLI11
+)
+
+##### CAMERAS
+
+add_executable(RUN_CAMERA run_camera.cpp)
+target_link_libraries(RUN_CAMERA
+    PRIVATE
+    PAYLOAD_LIB
+)
+
+add_executable(GEN_TILEPACK_RAW tilepack_test/generate_tilepack_raw.cpp)
+target_link_libraries(GEN_TILEPACK_RAW
+    PRIVATE
+    tilepack
+    core
+    vision
+)
+
+##### PREFILTERING
+
+add_executable(RUN_PREFILTER run_prefiltering.cpp)
+target_link_libraries(RUN_PREFILTER
+    PRIVATE
+    vision
+    ${OpenCV_LIBS}
+)
+
+##### REPROCESSING
+
+add_executable(reprocess_dataset reprocess_dataset.cpp)
+target_link_libraries(reprocess_dataset PRIVATE PAYLOAD_LIB CLI11::CLI11)
+
+add_executable(reprocess_image reprocess_image.cpp)
+target_link_libraries(reprocess_image PRIVATE PAYLOAD_LIB CLI11::CLI11)
+
+##### LANDMARK MEASUREMENTS
+
+add_executable(prepare_ldmeas prepare_ldmeas.cpp)
+target_link_libraries(prepare_ldmeas PRIVATE PAYLOAD_LIB)
+
+##### IMU
+
+add_executable(imu_run run_imu.cpp)
+target_link_libraries(imu_run PRIVATE PAYLOAD_LIB)

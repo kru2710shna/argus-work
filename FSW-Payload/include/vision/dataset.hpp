@@ -1,0 +1,110 @@
+#ifndef DATASET_HPP
+#define DATASET_HPP
+
+#include <vision/camera_manager.hpp>
+#include <imu/imu_manager.hpp>
+#include <vision/frame.hpp>
+
+#include <array>
+#include <vector>
+#include <string>
+#include <cstdint>
+#include <tuple>
+
+// Move all that to contexpr
+#define DATASET_CONFIG_FILE_NAME "dataset_config.toml"
+#define MAX_SAMPLES 255
+#define DEFAULT_COLLECTION_PERIOD 600
+#define ABSOLUTE_MINIMUM_PERIOD 0.1
+#define ABSOLUTE_MAXIMUM_PERIOD 10800 // 3h
+
+// Error codes TODO with framework
+
+struct DatasetConfig
+{
+    double maximum_period = DEFAULT_COLLECTION_PERIOD;
+    uint8_t target_frame_nb = MAX_SAMPLES;
+    CAPTURE_MODE capture_mode = CAPTURE_MODE::PERIODIC;
+    uint64_t capture_start_time = 0;
+    IMU_COLLECTION_MODE imu_collection_mode = IMU_COLLECTION_MODE::GYRO_ONLY;
+    uint8_t image_capture_rate = 60;
+    float imu_sample_rate_hz = 1.0f;
+    ProcessingStage target_processing_stage = ProcessingStage::NotPrefiltered;
+    std::array<bool, NUM_CAMERAS> active_cameras = {true, true, true, true};
+};
+
+inline bool IsValidCaptureMode(CAPTURE_MODE value)
+{
+    return (value >= CAPTURE_MODE::PERIODIC && 
+            value <= CAPTURE_MODE::PERIODIC_LDMK);
+}
+
+class Dataset
+{
+
+public:
+    // Static methos
+    static std::vector<std::string> ListAllStoredDatasets();
+    static bool isValidConfigurationFile(const std::string& config_file_path);
+    static bool isValidConfiguration(double max_period, uint8_t nb_frames, CAPTURE_MODE capture_mode, IMU_COLLECTION_MODE imu_collection_mode,
+                                    uint8_t image_capture_rate, float imu_sample_rate_hz, ProcessingStage target_processing_stage,
+                                    uint64_t capture_start_time);
+
+    // Getters
+    uint64_t GetCaptureStartTime() const { return capture_start_time; }
+    uint8_t GetTargetFrameNb() const { return target_frame_nb; }
+    double GetMaximumPeriod() const { return maximum_period; }
+    CAPTURE_MODE GetDatasetCaptureMode() const { return dataset_capture_mode; }
+    IMU_COLLECTION_MODE GetIMUCollectionMode() const { return imu_collection_mode; }
+    uint8_t GetImageCaptureRate() const { return image_capture_rate; }
+    float GetIMUSampleRateHz() const { return imu_sample_rate_hz; }
+    ProcessingStage GetTargetProcessingStage() const { return target_processing_stage; }
+    void SetTargetProcessingStage(ProcessingStage stage) { target_processing_stage = stage; }
+    std::array<bool, NUM_CAMERAS> GetActiveCameras() const { return active_cameras; }
+    std::string GetFolderPath() const { return folder_path; }
+    std::string GetIMUFilePath() const { return imu_log_file_path; }
+    std::vector<std::tuple<uint8_t, uint64_t>> GetStoredFrameIDs() const { return stored_frame_ids; }
+    void AddStoredFrameID(const std::tuple<uint8_t, uint64_t>& frame_id);
+    void AddStoredFrameIDs(const std::vector<std::tuple<uint8_t, uint64_t>>& frame_ids);
+
+    Json toJson() const;
+    bool fromJson(const Json& j);
+
+    bool OverlapsWith(const Dataset& other) const;
+    void InitializeOnDisk();
+
+    // Actual constructors ~ not to be used
+    Dataset(double max_period, uint8_t nb_frames, CAPTURE_MODE capture_mode, IMU_COLLECTION_MODE imu_collection_mode,
+            uint8_t image_capture_rate, float imu_sample_rate_hz, ProcessingStage target_processing_stage,
+            uint64_t capture_start_time=0);
+    Dataset(const DatasetConfig& config);
+
+    // TODO: Rethink if function below is truly needed, seems redundant with json
+    Dataset(const std::string& folder_path);
+
+    Dataset& operator=(const Dataset& other);
+
+private:
+    std::string folder_path;
+    std::string imu_log_file_path;
+    
+    uint64_t capture_start_time; // unix in ms. For scheduling
+    double maximum_period;
+    uint8_t target_frame_nb;
+    CAPTURE_MODE dataset_capture_mode;
+    IMU_COLLECTION_MODE imu_collection_mode;
+    uint8_t image_capture_rate; // [s]
+    float imu_sample_rate_hz; // [hz]
+    ProcessingStage target_processing_stage;
+
+    std::array<bool, NUM_CAMERAS> active_cameras = {true, true, true, true};
+    std::vector<std::tuple<uint8_t, uint64_t>> stored_frame_ids; // for statistics, not intended to be used for loading frames (too heavy)
+
+    bool CreateConfigurationFile();
+    static bool validateRawParams(double max_period, uint64_t target_frame_nb,
+                                  uint64_t capture_mode, uint64_t imu_mode,
+                                  uint64_t image_rate, float imu_rate,
+                                  uint64_t proc_stage);
+};
+
+#endif // DATASET_HPP

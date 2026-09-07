@@ -1,0 +1,14 @@
+# Path to the folder containing directories named with MGRS region IDs containing geotiff files used for image simulation
+geotiff_folder: /mnt/sda2/geotiffs/ 
+# The name of the Earth Engine project that will be used by image_simulator/eedl.py to fetch the geotiff files
+earth_engine_project_name: argus-payload 
+# The directory where the Blue Marble Next Generation dataset is stored
+blue_marble_directory: /mnt/nvme1n1p3/blue_marble 
+# The directory where the training data is stored as it is being generated, processed, labelled, and trained on
+# If you are working with multiple datasets, just pick one to use for the script you are running
+training_directory: /mnt/sda2/training/
+# The directory where the trained models will be loaded from
+# If you train your own models, the models_directory can be the same as the training_directory
+models_directory: /home/argus/sunac/Vision_Payload/training_directory
+# The directory where the output files from the result of running the files in the scripts directory will be saved
+output_directory: /home/argus/sunac/Vision_Payload

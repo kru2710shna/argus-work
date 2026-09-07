@@ -1,0 +1,154 @@
+/*
+
+This file contains classes and functions providing file services and data handling to the flight software.
+
+*/
+
+#ifndef DATA_HANDLING_HPP
+#define DATA_HANDLING_HPP
+
+#include <filesystem>
+#include <cstdint>
+#include <string_view>
+#include <vector>
+#include <opencv2/opencv.hpp>
+#include "spdlog/spdlog.h"
+#include "vision/frame.hpp"
+#include "vision/dataset.hpp"
+#include "core/errors.hpp"
+
+#define ROOT_DISK "/"
+
+#define ROOT_DATA_FOLDER "data/"
+#define IMAGES_FOLDER "data/images/"
+#define TELEMETRY_FOLDER "data/telemetry/"
+#define DATASETS_FOLDER "data/datasets/"
+#define RESULTS_FOLDER "data/results/"
+#define LOGGING_FOLDER "data/logging/"
+#define COMMS_FOLDER "data/comms/"
+
+
+#define DELIMITER "_"
+
+enum class ImageFormat : uint8_t { PNG = 0, JPG = 1 };
+
+inline const char* ImageFormatToString(ImageFormat fmt)
+{
+    return fmt == ImageFormat::JPG ? "JPG" : "PNG";
+}
+
+inline const char* ImageFormatExtension(ImageFormat fmt)
+{
+    return fmt == ImageFormat::JPG ? ".jpg" : ".png";
+}
+
+namespace DH // Data Handling
+{
+    namespace fs = std::filesystem;
+    constexpr std::uint16_t DH_PACKET_HEADER_SIZE = 2;
+    constexpr std::uint16_t DH_MAX_PAYLOAD_SIZE = 240;
+    constexpr std::uint16_t DH_FIXED_PACKET_SIZE = DH_PACKET_HEADER_SIZE + DH_MAX_PAYLOAD_SIZE; // 242 bytes on disk
+    constexpr std::uint16_t DH_FILE_HEADER_SIZE = 5; // magic number length
+
+    /*
+        Initialize the folder structure for all data storage activities.
+        The structure is as follows:
+        data/
+        ├── images/
+        ├── telemetry/
+        ├── datasets/
+        ├── results/ (orbit determination results)
+        ├── logging/
+        └── comms/ (Special folder for communication purposes)
+
+        @return true if successful, false otherwise
+    */
+    bool InitializeDataStorage();
+
+
+    bool MakeNewDirectory(std::string_view directory_path);
+    long GetFileSize(std::string_view file_path); // in bytes
+    long GetDirectorySize(std::string_view directory_path); 
+    int CountFilesInDirectory(std::string_view directory_path);
+    std::string getExtension(const std::string& path);
+
+    // Store a dataset on disk
+    std::string StoreDatasetToDisk(Dataset& dataset);
+    // Store entire dataset metadata with all frame data for downloading
+    std::string StoreProcessingMetadataToDisk(Dataset& dataset);
+    // Load a dataset from disk by its .json file path
+    bool readDatasetFromDisk(const std::string& dataset_file_path, Dataset& dataset_out);
+    // Store a raw image and frame class information to disk
+    std::string StoreFrameToDisk(Frame& frame,
+                                  std::string_view target_folder = IMAGES_FOLDER,
+                                  ImageFormat fmt = ImageFormat::JPG,
+                                  int jpg_quality = 100);
+    // raw_timestamp_camid.{png|jpg}
+    std::string StoreRawImgToDisk(std::uint64_t timestamp, int cam_id, const cv::Mat& img,
+                                   std::string_view target_folder = IMAGES_FOLDER,
+                                   ImageFormat fmt = ImageFormat::JPG,
+                                   int jpg_quality = 100);
+    // frame_timestamp_camid.json  — auto-discovers the corresponding raw image file
+    void StoreFrameMetadataToDisk(Frame& frame, std::string_view target_folder = IMAGES_FOLDER);
+
+    // Load frames in memory
+
+    bool ReadLatestStoredRawImg(Frame& frame);
+    bool ReadHighestValueStoredRawImg(Frame& frame);
+    
+    // Load an image from disk by its path
+    bool ReadImageFromDisk(const std::string& file_path, Frame& frame_out, int cam_id=0, std::uint64_t timestamp=0);
+    // Load an image from disk by its timestamp and cam_id, optionally from a dataset folder
+    bool ReadImageFromDisk(std::uint64_t timestamp, int cam_id, Frame& frame_out, std::string_view target_folder = IMAGES_FOLDER);
+    // Load image information to json
+    Json LoadFrameMetadataFromDisk(std::uint64_t timestamp, int cam_id, std::string_view target_folder = IMAGES_FOLDER);
+
+    // Load the latest binary image file with packet header (img_<timestamp>_<camera_id>.bin)
+    // Returns the file path if found, empty string otherwise
+    std::string GetLatestImgBinPath();
+    
+    // Load in memory a chunk of data
+    EC ReadFileChunk(std::string_view file_path, uint32_t start_byte, uint32_t length, std::vector<uint8_t>& data_out);
+
+    // count the number of images in the images folder
+    int CountRawImgNumberOnDisk();
+
+
+
+    // need to read from disk (transfre img from disk to RAM) - reinitialize the frame buffer
+    // need to be able to select the latest img from the disk
+    // need to save telemetry data on disk
+
+
+
+    // Returns true if the latest file is found, false otherwise
+    bool GetLatestRawFilePath(std::filesystem::directory_entry& latest_file);
+    bool GetHighestValueRawFilePath(std::filesystem::directory_entry& highest_value_file);
+
+    /*
+    Assumes the primary system disk is an NVMe drive as the main root partition (/)
+    Returns the disk usage as a positive percentage. -1 in case of errors.
+    */
+    int GetTotalDiskUsage();
+
+
+    // Communication related helper functions
+    void EmptyCommsFolder();
+    std::string CopyFrameToCommsFolder(Frame& frame);
+    EC GetCommsFilePath(std::string& path_out);
+
+    // Data handler formatted fixed-packet files (matches Python FileProcess)
+    bool WriteFixedPacketFile(const std::string& output_path, const std::vector<std::vector<uint8_t>>& payloads);
+    bool ReadFixedPacketFile(const std::string& input_path, std::vector<std::vector<uint8_t>>& payloads_out);
+
+
+
+}
+
+
+
+
+
+
+
+#endif // DATA_HANDLING_HPP

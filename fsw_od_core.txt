@@ -1,0 +1,1803 @@
+===== FSW README =====
+# Payload Flight Software for Argus
+
+This repository contains the Argus Payload Flight Software for the Jetson Orin Nano (8GB) and its custom carrier board. Argus is a technology demonstration mission focused on vision-based orbit determination.
+
+## Install instructions 
+
+- CUDA
+- TensorRT
+- [spdlog](https://github.com/gabime/spdlog) - Logging library
+- [OpenCV](https://docs.opencv.org/4.x/d7/d9f/tutorial_linux_install.html?ref=wasyresearch.com) - Computer vision library
+- [Eigen3](http://eigen.tuxfamily.org/index.php?title=Main_Page#Download) - Linear algebra Library
+- [GTest](https://github.com/google/googletest) - testing framework
+- TODO
+
+The `models` submodule now tracks the DVC-based workflow on its `dvc` branch. A normal submodule checkout gives you the Git metadata, but the large model artifacts still need to be fetched with `dvc pull`.
+
+Then install the project dependencies:
+
+```bash
+sudo chmod +x install_deps.sh build.sh run.sh 
+./install_deps.sh
+```
+
+The install script installs the system dependencies needed for the project, including `pipx` and `dvc[ssh]` for model artifact pulls.
+
+The build script now:
+
+- syncs and initializes the submodules
+- runs `dvc pull` inside `models` before compiling if `dvc` is available
+
+If you want to move `models` to the latest commit on its tracked `dvc` branch instead of the commit pinned by the parent repo, run:
+
+```bash
+git submodule update --init --recursive --remote models
+```
+
+If you ever need to refresh the model artifacts manually after updating the submodule, run:
+
+```bash
+cd models
+dvc pull
+cd ..
+```
+
+If `dvc` is installed but not found in a new shell, run `pipx ensurepath` and restart the terminal.
+
+#### OpenCV
+
+OpenCV needs to be installed with CUDA support. The OpenCV version that is natively installed on the jetson won't have cuda support. The installation guide to include cuda support is provided in https://qengineering.eu/install-opencv-on-jetson-nano.html. The shell script install_opencv4.9.0_Jetpack6.0.sh is taken from there, running it will take approximately 2 hours.
+
+## Build instructions
+
+Give permissions to both scripts 
+```bash
+sudo chmod +x build.sh run.sh 
+```
+
+### Setting up the Environment
+
+To compile using CMake, build the project using the helper script:
+
+```bash
+./build.sh [Debug|Release] [disable-nn]
+./bin/PAYLOAD [optional: <communication-interface: [UART, CLI]>]
+```
+
+All binaries will appear in the bin folder.
+
+## Configuration
+
+The configuration file is located at config/config.toml. Update this file to modify system parameters.
+
+## Local interaction with the FSW
+
+As a functional debugging tool, the Payload can be run and controlled locally through a command-line interface, either through the compiled one or the python interface (perfect replica). First, run the main process in CLI mode:
+
+```bash
+./bin/PAYLOAD [optional: <communication-interface: [UART, CLI]>] // default to UART 
+```
+In another terminal, launch either the compiled CLI or its python equivalent (perfect replica):
+```bash
+./bin/CLI_CMD
+or
+python python/cli_cmd.py
+```
+
+Under the hood, both processes communicates through 2 distinct named pipes (FIFO).
+
+## Command-based paradigm 
+
+The Payload communicates through its host machine via UART (transition from SPI in progress) with a set of predefined commands available at TODO (internal README).
+===== FSW Python optimizer =====
+"""
+CasADi/IPOPT batch orbit determination optimizer — fixed gyro bias, constrained dynamics.
+
+Decision variables:
+  r[i]  — ECI position        (3,)  [km]        per state
+  v[i]  — ECI velocity        (3,)  [km/s]      per state
+  q[i]  — body-to-ECI quat    (4,)  [x,y,z,w]  per state  (||q||=1 constraint)
+  a[i]  — unmodelled accel    (3,)  [km/s²]     per interval
+  b     — fixed gyro bias     (3,)  [rad/s]     global
+
+Equality constraints (IPOPT enforces these to machine precision):
+  linear dynamics:  propagate([r_i; v_i]) via Forward Euler or RK4 using
+                    f(r,v) = [v; a_kepler(r) + a_J2(r) + a_drag(r,v) + a_i]
+                    (J2 and drag are optional; a_i is the per-interval UMA)
+  quaternion norm:  ||q_i||² = 1
+
+Soft cost (quadratic):
+  • UMA prior            ‖a_i / σ_a‖²         encourages small unmodelled forces
+  • Angular dynamics     ‖q_err_i / σ_q‖²     gyro integration residual
+  • Landmark bearing     ‖Δbearing / σ_lmk‖²  vision measurement residual
+
+Enforcing dynamics as equality constraints lets σ_a be set to the true expected
+magnitude of unmodelled forces (e.g. 1e-4 km/s²) without ill-conditioning —
+IPOPT's interior-point solver handles the constraint structure directly.
+"""
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import casadi as ca
+import numpy as np
+import scipy.linalg
+
+from data_loader import get_state_timestamps
+from residuals import (
+    IntegratorType,
+    OrbitalDynamics,
+    angular_dynamics_residual_fix_bias,
+    drag_prior_residual,
+    landmark_residual,
+    linear_dynamics_constraint,
+    pseudo_huber_cost,
+    uma_prior_residual,
+)
+
+# ── Noise / prior parameters ───────────────────────────────────────────────────
+UMA_STD_DEV     = 1e-5        # km/s²  — expected magnitude of unmodelled forces
+GYRO_WN_STD_DEV = 0.0008726   # rad/s  — gyro white noise std dev
+LANDMARK_STD    = 0.009       # rad    — landmark bearing noise
+
+R_ORBIT_KM = 6371.0 + 600.0  # default orbital altitude for position initialisation
+
+
+# ── Trajectory initializer ───────────────────────────────────────────────────────
+
+def _wahba_svd(B: np.ndarray) -> np.ndarray:
+    """
+    Wahba's problem via SVD: find rotation R minimising sum‖d_eci − R·b_body‖².
+    B = Σ d_eci · b_body^T.  Returns identity quaternion [x,y,z,w] on degenerate input.
+    """
+    if np.linalg.norm(B) < 1e-9:
+        return np.array([0.0, 0.0, 0.0, 1.0])
+    U, _, Vt = np.linalg.svd(B)
+    diag = np.array([1.0, 1.0, np.linalg.det(U @ Vt)])
+    R = U @ np.diag(diag) @ Vt
+    # Convert rotation matrix to quaternion [x, y, z, w]
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([x, y, z, w])
+    return q / np.linalg.norm(q)
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
+    """SLERP between two unit quaternions [x,y,z,w]."""
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = min(dot, 1.0)
+    if dot > 0.9995:
+        return (q0 + alpha * (q1 - q0)) / np.linalg.norm(q0 + alpha * (q1 - q0))
+    theta0 = np.arccos(dot)
+    theta  = theta0 * alpha
+    sin0   = np.sin(theta0)
+    return np.sin(theta0 - theta) / sin0 * q0 + np.sin(theta) / sin0 * q1
+
+
+class TrajectoryInitializer:
+    """
+    Mirrors C++ TrajectoryInitializer in src/navigation/trajectory_initializer.cpp.
+
+    Per-group pose keyframes:
+      position  = mean landmark ECI position renormalised to R_ORBIT_KM
+      attitude  = Wahba SVD on (satellite-to-landmark ECI direction, body bearing) pairs
+
+    All states:
+      position  = linear interpolation/extrapolation between keyframes
+      attitude  = SLERP between keyframes
+      velocity  = central finite differences of position
+
+    Gyro bias (fixed):
+      mean over all states of (ω_meas − ω_att),
+      where ω_att ≈ 2·(q₀⁻¹⊗q₁).vec / dt
+    """
+
+    def __init__(
+        self,
+        state_timestamps:       list[float],
+        landmark_measurements:  np.ndarray,   # (N, 7): [t, bx, by, bz, ex, ey, ez]
+        landmark_group_starts:  np.ndarray,   # (N,) bool
+        gyro_measurements:      np.ndarray,   # (M, 4): [t, wx, wy, wz] rad/s
+        estimate_bias:          bool = True,
+    ) -> None:
+        ts = np.array(state_timestamps)
+        M  = len(ts)
+        N_lmk = len(landmark_measurements)
+
+        # ── Build pose keyframes (one per landmark group) ─────────────────────
+        keyframe_t:   list[float]      = []
+        keyframe_pos: list[np.ndarray] = []
+        keyframe_quat: list[np.ndarray] = []
+
+        i = 0
+        while i < N_lmk:
+            if not landmark_group_starts[i]:
+                i += 1
+                continue
+
+            t_group = landmark_measurements[i, 0]
+            lm_pos_list:  list[np.ndarray] = []
+            bearing_list: list[np.ndarray] = []
+
+            # collect all rows belonging to this group
+            while i < N_lmk and (len(lm_pos_list) == 0 or not landmark_group_starts[i]):
+                lm_pos_list.append(landmark_measurements[i, 4:7].copy())
+                bearing_list.append(landmark_measurements[i, 1:4].copy())
+                i += 1
+
+            if not lm_pos_list:
+                continue
+
+            pos_sum = sum(lm_pos_list)
+            norm    = np.linalg.norm(pos_sum)
+            if norm < 1e-6:
+                continue
+            r_group = pos_sum / norm * R_ORBIT_KM
+
+            B = np.zeros((3, 3))
+            for lm_pos, bearing in zip(lm_pos_list, bearing_list):
+                diff = lm_pos - r_group
+                d    = np.linalg.norm(diff)
+                if d < 1e-6:
+                    continue
+                B += np.outer(diff / d, bearing)
+
+            keyframe_t.append(t_group)
+            keyframe_pos.append(r_group)
+            keyframe_quat.append(_wahba_svd(B))
+
+        # ── Interpolate to all state timestamps ───────────────────────────────
+        positions  = np.zeros((M, 3))
+        quaternions = np.zeros((M, 4))
+        quaternions[:, 3] = 1.0   # identity [x,y,z,w]
+
+        if not keyframe_t:
+            positions[:, 2] = R_ORBIT_KM
+        else:
+            kf_t = np.array(keyframe_t)
+            kf_p = np.array(keyframe_pos)    # (K, 3)
+            kf_q = np.array(keyframe_quat)   # (K, 4)
+            K    = len(kf_t)
+
+            for j, t in enumerate(ts):
+                if K == 1:
+                    positions[j]  = kf_p[0]
+                    quaternions[j] = kf_q[0]
+                elif t <= kf_t[0]:
+                    # Extrapolate before first keyframe
+                    dt = kf_t[1] - kf_t[0]
+                    if abs(dt) < 1e-9:
+                        positions[j] = kf_p[0]
+                    else:
+                        positions[j] = kf_p[0] + (kf_p[1] - kf_p[0]) / dt * (t - kf_t[0])
+                    quaternions[j] = kf_q[0]
+                elif t >= kf_t[-1]:
+                    dt = kf_t[-1] - kf_t[-2]
+                    if abs(dt) < 1e-9:
+                        positions[j] = kf_p[-1]
+                    else:
+                        positions[j] = kf_p[-1] + (kf_p[-1] - kf_p[-2]) / dt * (t - kf_t[-1])
+                    quaternions[j] = kf_q[-1]
+                else:
+                    idx = int(np.searchsorted(kf_t, t, side="right")) - 1
+                    idx = max(0, min(idx, K - 2))
+                    alpha = (t - kf_t[idx]) / (kf_t[idx + 1] - kf_t[idx])
+                    positions[j] = (1.0 - alpha) * kf_p[idx] + alpha * kf_p[idx + 1]
+                    quaternions[j] = _slerp(kf_q[idx], kf_q[idx + 1], alpha)
+
+        # ── Renormalize positions to orbital altitude ─────────────────────────
+        # Linear interpolation between keyframes in very different ECI directions
+        # (e.g. from bad landmark groups) can produce positions inside Earth.
+        # Renormalising to R_ORBIT_KM keeps the initial guess physically valid.
+        for j in range(M):
+            norm = np.linalg.norm(positions[j])
+            if norm > 1e-6:
+                positions[j] = positions[j] / norm * R_ORBIT_KM
+
+        # ── Velocity: central finite differences ──────────────────────────────
+        velocities = np.zeros((M, 3))
+        for j in range(M):
+            i0 = max(0, j - 1)
+            i1 = min(M - 1, j + 1)
+            if i0 == i1:
+                continue
+            dt = ts[i1] - ts[i0]
+            velocities[j] = (positions[i1] - positions[i0]) / dt
+
+        # ── Gyro bias: mean(ω_meas − ω_att) ──────────────────────────────────
+        gyro_bias = np.zeros(3)
+        if estimate_bias and len(gyro_measurements) > 0:
+            Mg = len(gyro_measurements)
+            Nb = min(M, Mg)
+            bias_sum = np.zeros(3)
+            count    = 0
+            for j in range(Nb):
+                i0 = j if j < M - 1 else j - 1
+                i1 = i0 + 1
+                dt = ts[i1] - ts[i0]
+                if abs(dt) < 1e-9:
+                    continue
+                # q0^{-1} ⊗ q1 — Hamilton product with q0 conjugated
+                q0  = quaternions[i0]  # [x,y,z,w]
+                q1  = quaternions[i1]
+                # conjugate of q0: [-x,-y,-z,w]
+                q0c = np.array([-q0[0], -q0[1], -q0[2], q0[3]])
+                # Hamilton product q0c ⊗ q1
+                x0, y0, z0, w0 = q0c
+                x1, y1, z1, w1 = q1
+                dq_vec = np.array([
+                    w0*x1 + x0*w1 + y0*z1 - z0*y1,
+                    w0*y1 - x0*z1 + y0*w1 + z0*x1,
+                    w0*z1 + x0*y1 - y0*x1 + z0*w1,
+                ])
+                omega_att = 2.0 * dq_vec / dt
+                omega_meas = gyro_measurements[j, 1:4]
+                bias_sum += omega_meas - omega_att
+                count    += 1
+            if count > 0:
+                gyro_bias = bias_sum / count
+
+        self.positions   = positions    # (M, 3)
+        self.velocities  = velocities   # (M, 3)
+        self.quaternions = quaternions  # (M, 4)  [x,y,z,w]
+        self.gyro_bias   = gyro_bias    # (3,)
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────────
+
+def _build_landmark_groups(
+    landmark_group_starts: np.ndarray,
+    lmk_group_indices: list[int],
+) -> list[tuple[int, list[int]]]:
+    """Return a list of (state_idx, [measurement_row_indices]) per landmark group."""
+    groups: list[tuple[int, list[int]]] = []
+    group_k = 0
+    for row in range(len(landmark_group_starts)):
+        if landmark_group_starts[row]:
+            groups.append((lmk_group_indices[group_k], []))
+            group_k += 1
+        groups[-1][1].append(row)
+    return groups
+
+
+def _filter_landmark_measurements(
+    landmark_measurements:  np.ndarray,
+    landmark_group_starts:  np.ndarray,
+    landmark_uncertainties: np.ndarray | None,
+    keep_mask:              np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """
+    Return filtered landmark arrays keeping only rows where keep_mask is True.
+
+    Reconstructs landmark_group_starts so the first surviving row of each
+    original group is marked as a group start.  Groups that lose all rows are
+    removed entirely.
+    """
+    group_ids = np.cumsum(landmark_group_starts).astype(int) - 1  # 0-based group index per row
+
+    filtered_meas      = landmark_measurements[keep_mask]
+    filtered_group_ids = group_ids[keep_mask]
+
+    if len(filtered_meas) == 0:
+        empty_unc = np.array([], dtype=np.float64) if landmark_uncertainties is not None else None
+        return filtered_meas, np.array([], dtype=bool), empty_unc
+
+    new_group_starts     = np.zeros(len(filtered_group_ids), dtype=bool)
+    new_group_starts[0]  = True
+    new_group_starts[1:] = filtered_group_ids[1:] != filtered_group_ids[:-1]
+
+    filtered_unc = landmark_uncertainties[keep_mask] if landmark_uncertainties is not None else None
+    return filtered_meas, new_group_starts, filtered_unc
+
+
+def _quat_tangent_basis(q: np.ndarray) -> np.ndarray:
+    """
+    4×3 orthonormal basis for the tangent space of unit quaternion q.
+    The tangent space is the 3D subspace of R^4 orthogonal to q.
+    """
+    q = q / np.linalg.norm(q)
+    A = np.empty((4, 4))
+    A[:, 0] = q
+    A[:, 1:] = np.eye(4)[:, :3]
+    Q, _ = np.linalg.qr(A)
+    return Q[:, 1:]   # 4×3
+
+
+def _build_tangent_projection(
+    q_vals: np.ndarray, N: int, N_uma: int, use_cd: bool = False
+) -> np.ndarray:
+    """
+    Build the (n_full) × (n_reduced) tangent-space projection matrix T.
+
+    Full parameter vector  x = [vec(r); vec(v); vec(q); vec(a); b; (cd)]
+    sizes:                      3N       3N       4N      3·N_uma  3   (1)
+    n_full = 10N + 3·N_uma + 3 (+ 1 if use_cd)
+
+    Reduced (tangent) vector x_t = [vec(r); vec(v); vec(q_t); vec(a); b; (cd)]
+    sizes:                           3N       3N       3N       3·N_uma  3   (1)
+    n_reduced = 9N + 3·N_uma + 3 (+ 1 if use_cd)
+
+    Only the quaternion blocks need non-trivial projection (4→3 per state).
+    All other blocks are identity.
+    """
+    n_cd      = 1 if use_cd else 0
+    n_full    = 10 * N + 3 * N_uma + 3 + n_cd
+    n_reduced =  9 * N + 3 * N_uma + 3 + n_cd
+    T = np.zeros((n_full, n_reduced))
+
+    # r block
+    T[:3*N, :3*N] = np.eye(3 * N)
+
+    # v block
+    T[3*N:6*N, 3*N:6*N] = np.eye(3 * N)
+
+    # q tangent blocks
+    for i in range(N):
+        B = _quat_tangent_basis(q_vals[i])   # 4×3
+        T[6*N + 4*i : 6*N + 4*i + 4,
+          6*N + 3*i : 6*N + 3*i + 3] = B
+
+    # a (UMA) block — no manifold constraint, identity pass-through
+    a_row = 10 * N
+    a_col =  9 * N
+    T[a_row : a_row + 3*N_uma, a_col : a_col + 3*N_uma] = np.eye(3 * N_uma)
+
+    # b (bias) block
+    T[a_row + 3*N_uma : a_row + 3*N_uma + 3,
+      a_col + 3*N_uma : a_col + 3*N_uma + 3] = np.eye(3)
+
+    # cd block (scalar, identity) — only present when estimating drag
+    if use_cd:
+        T[-1, -1] = 1.0
+
+    return T
+
+
+def _compute_covariance(
+    cost_residuals_sym: list[ca.MX],
+    dyn_constraint_syms: list[ca.MX],
+    sol: ca.OptiSol,
+    r: ca.MX,
+    v: ca.MX,
+    q: ca.MX,
+    a: ca.MX,
+    b: ca.MX,
+    N: int,
+    cd: ca.MX | None = None,
+) -> dict[str, np.ndarray]:
+    """
+    Approximate covariance from the augmented Jacobian at the solution.
+
+    For a constrained least-squares problem the covariance comes from:
+        Σ ≈ (J_aug^T J_aug)^{-1}
+    where J_aug stacks:
+      • The Jacobian of all soft cost residuals (angular, landmark, UMA prior,
+        and drag prior when cd is estimated)
+      • The Jacobian of the dynamics equality constraints, scaled by a tight
+        normalisation factor — this captures the constraint coupling between
+        states and UMA without needing to form the full KKT matrix.
+
+    Quaternion blocks are projected onto their 3D tangent space.
+
+    Returns
+    -------
+    dict with:
+        pos_var    : (N, 3)       position variance        [km²]
+        vel_var    : (N, 3)       velocity variance        [(km/s)²]
+        rot_var    : (N, 3)       attitude tangent variance [rad²]
+        uma_var    : (N_uma, 3)   UMA variance             [(km/s²)²]
+        bias_var   : (3,)         gyro bias variance       [(rad/s)²]
+        cd_var     : float        drag cd variance         [-]  (only if cd given)
+    """
+    print("[covariance] Building symbolic Jacobian …")
+
+    N_uma      = N - 1
+    use_cd = cd is not None
+
+    # Full symbolic parameter vector (column-major vectorisation)
+    x_sym = ca.vertcat(ca.vec(r), ca.vec(v), ca.vec(q), ca.vec(a), b)
+    if use_cd:
+        x_sym = ca.vertcat(x_sym, cd)
+
+    DYN_NORM = 1e-6   # km / (km/s) representative scale — tunable
+    dyn_sym  = ca.vertcat(*[c / DYN_NORM for c in dyn_constraint_syms])
+
+    r_sym = ca.vertcat(*cost_residuals_sym, dyn_sym)
+
+    J_sym = ca.jacobian(r_sym, x_sym)
+    J_fn  = ca.Function("J", [x_sym], [J_sym])
+
+    # Evaluate at solution
+    r_val = sol.value(r)              # (3, N)
+    v_val = sol.value(v)              # (3, N)
+    q_val = sol.value(q)              # (4, N)
+    a_val = np.asarray(sol.value(a)) if N_uma > 1 else np.asarray(sol.value(a)).reshape(3, 1)
+    b_val = sol.value(b)              # (3,)
+
+    x_val = np.concatenate([
+        r_val.ravel(order="F"),
+        v_val.ravel(order="F"),
+        q_val.ravel(order="F"),
+        a_val.ravel(order="F"),
+        np.asarray(b_val).ravel(),
+    ])
+    if use_cd:
+        x_val = np.concatenate([x_val, [float(sol.value(cd))]])
+
+    print("[covariance] Evaluating Jacobian at solution …")
+    J_val = np.array(J_fn(x_val))
+
+    print("[covariance] Projecting to tangent space …")
+    T = _build_tangent_projection(q_val.T, N, N_uma, use_cd=use_cd)
+    J_reduced = J_val @ T
+
+    # Diagonal of (J^T J)^{-1} via SVD — avoids forming J^T J explicitly
+    print("[covariance] Computing SVD …")
+    _, S, Vt = scipy.linalg.svd(J_reduced, full_matrices=False)
+
+    tol      = S[0] * max(J_reduced.shape) * np.finfo(float).eps * 1e3
+    S_safe   = np.where(S > tol, S, np.inf)
+    cov_diag = np.sum((Vt.T / S_safe) ** 2, axis=1)
+
+    pos_var  = cov_diag[             :  3*N         ].reshape(N,     3, order="F")
+    vel_var  = cov_diag[ 3*N         :  6*N         ].reshape(N,     3, order="F")
+    rot_var  = cov_diag[ 6*N         :  9*N         ].reshape(N,     3, order="F")
+    uma_var  = cov_diag[ 9*N         :  9*N+3*N_uma ].reshape(N_uma, 3, order="F")
+    bias_var = cov_diag[ 9*N+3*N_uma :  9*N+3*N_uma+3 ]
+
+    result = {
+        "pos_var":  pos_var,
+        "vel_var":  vel_var,
+        "rot_var":  rot_var,
+        "uma_var":  uma_var,
+        "bias_var": bias_var,
+    }
+    if use_cd:
+        result["cd_var"] = float(cov_diag[9*N + 3*N_uma + 3])
+    return result
+
+
+def compute_covariance(context: dict) -> dict:
+    """
+    Compute covariance from a context captured by build_and_solve(return_covariance_context=True).
+
+    Performs the Jacobian evaluation and SVD without re-running IPOPT.
+    """
+    cov_start = time.perf_counter()
+    cov = _compute_covariance(
+        context["cost_residuals"],
+        context["dyn_constraint_syms"],
+        context["sol"],
+        context["r"], context["v"], context["q"], context["a"], context["b"],
+        context["N"],
+        cd=context.get("cd"),
+    )
+    covariance_time_ms = (time.perf_counter() - cov_start) * 1000.0
+    print(f"[covariance] Complete in {covariance_time_ms:.1f} ms")
+    return cov
+
+
+def compute_outlier_residuals(
+    result: dict,
+    landmark_measurements:  np.ndarray,         # full original (N_total, 7)
+    landmark_uncertainties: np.ndarray | None,  # full original (N_total,) or None
+) -> np.ndarray:
+    """
+    Evaluate landmark residuals for rejected measurements against the final solution.
+
+    Uses the CasADi landmark_residual function with the converged positions and
+    quaternions, so the geometry is identical to what was used during the solve.
+
+    Returns
+    -------
+    outlier_res : (N_outliers, 3) float64
+        σ-normalised residual vectors, in the same order as the rejected rows
+        of landmark_measurements (i.e. where lmk_outlier_flags == 1).
+    """
+    flags    = np.asarray(result["lmk_outlier_flags"])
+    outlier_mask = flags == 1
+    if not outlier_mask.any():
+        return np.zeros((0, 3))
+
+    outlier_meas = landmark_measurements[outlier_mask]
+    outlier_unc  = (landmark_uncertainties[outlier_mask]
+                    if landmark_uncertainties is not None
+                    else np.full(outlier_mask.sum(), LANDMARK_STD))
+
+    ts_final   = np.asarray(result["state_timestamps"])
+    pos_final  = result["positions"]    # (N, 3)
+    quat_final = result["quaternions"]  # (N, 4) [x,y,z,w]
+    M = len(ts_final)
+
+    outlier_res = np.zeros((outlier_mask.sum(), 3))
+    for j, (meas, sigma) in enumerate(zip(outlier_meas, outlier_unc)):
+        t_lmk = float(meas[0])
+        lo = int(np.searchsorted(ts_final, t_lmk))
+        if lo == 0:
+            idx = 0
+        elif lo == M:
+            idx = M - 1
+        else:
+            idx = lo if ts_final[lo] - t_lmk < t_lmk - ts_final[lo - 1] else lo - 1
+
+        res = landmark_residual(
+            pos_final[idx],   # (3,) → ca.DM
+            quat_final[idx],  # (4,) → ca.DM
+            meas[4:7],        # landmark ECI position
+            meas[1:4],        # measured bearing
+            float(sigma),
+        )
+        outlier_res[j] = np.asarray(res).ravel()
+
+    return outlier_res
+
+
+# ── Main solver ─────────────────────────────────────────────────────────────────
+
+def build_and_solve(
+    landmark_measurements:  np.ndarray,         # (N_lmk, 7): [t_j2000, bx, by, bz, ex, ey, ez]
+    landmark_group_starts:  np.ndarray,         # (N_lmk,) bool
+    gyro_measurements:      np.ndarray,         # (N_gyro, 4): [t_j2000, wx, wy, wz] rad/s
+    landmark_uncertainties: np.ndarray | None = None,  # (N_lmk,) per-measurement sigma [rad]
+    uma_std:         float          = UMA_STD_DEV,
+    integrator_type: IntegratorType = IntegratorType.FORWARD_EULER,
+    use_j2:           bool        = False,
+    use_drag:         bool        = False,
+    cd_nominal:       float       = 2.2,
+    cd_std:       float | None = None,
+    ipopt_opts:       dict | None  = None,
+    compute_covariance: bool       = True,
+    warm_start:         dict | None = None,
+    landmark_huber_M:   float      = 3.0,
+    return_covariance_context: bool = False,
+) -> dict:
+    """
+    Build and solve the constrained fixed-bias batch OD problem.
+
+    Linear dynamics are enforced as IPOPT equality constraints; the unmodelled
+    acceleration a[i] absorbs any model error and is penalised by a Gaussian
+    prior with standard deviation uma_std [km/s²].
+
+    Parameters
+    ----------
+    integrator_type : IntegratorType
+        FORWARD_EULER (default) or RK4.
+    use_j2 : bool
+        Include J2 zonal harmonic gravity perturbation in the dynamics model.
+    use_drag : bool
+        Include exponential-density atmospheric drag in the dynamics model.
+        When True, cd_nominal and cd_std must be provided.
+    cd_nominal : float
+        Prior mean / initial guess for Cd  [-].
+        Unit conversion: 1 m²/kg = 1×10⁻⁶ km²/kg.
+        Assumed for argus CubeSat (Cd=2.2, A=0.01 m², m=1.3 kg): cd ≈ 2.2.
+    cd_std : float | None
+        Prior standard deviation for cd  [-].  Required when use_drag=True.
+    compute_covariance : bool
+        When True, compute covariance inline after solving (step 8).
+        Mutually exclusive with return_covariance_context.
+    return_covariance_context : bool
+        When True, include a ``_covariance_context`` key in the result dict
+        containing all objects needed to call ``compute_covariance()`` later,
+        without re-running IPOPT.  Use this in the outlier-rejection loop so
+        the caller can defer the (expensive) Jacobian evaluation until
+        convergence is confirmed.
+===== FSW OD C++ =====
+#include "navigation/od.hpp"
+#include "spdlog/spdlog.h"
+#include "toml.hpp"
+#include <filesystem>
+#include <stdexcept>
+
+
+INIT_config::INIT_config()
+: 
+collection_period(10),
+target_samples(20), 
+max_collection_time(3600), // 1 hr
+max_downtime_for_restart(60) // 1hr
+{
+}
+
+BATCH_OPT_config::BATCH_OPT_config()
+: 
+solver_function_tolerance(1e-6),
+solver_parameter_tolerance(1e-10),
+max_iterations(10000),
+max_run_time_sec(120.0),
+bias_mode(BIAS_MODE::FIX_BIAS),
+compute_covariance(false),
+use_j2(true),
+use_drag(false),
+cd_nominal(2.2),
+cd_std(1.0),
+integrator(Integrator::EULER)
+{
+}
+
+OD_Config::OD_Config()
+{
+}
+
+
+
+OD::OD(const std::string& config_path)
+{
+    SPDLOG_INFO("Will read OD configuration file...");
+    (void)ReadConfig(config_path);
+}
+
+OD::~OD()
+{
+}
+
+
+ErrorCode OD::ReadConfig(const std::string& config_path)
+{
+    toml::table params;
+    if (!std::filesystem::exists(config_path)) {
+        SPDLOG_ERROR("OD config file does not exist: {}", config_path);
+        return ErrorCode::FILE_DOES_NOT_EXIST;
+    }
+
+    try
+    {
+        params = toml::parse_file(config_path);
+    }
+    catch (const toml::parse_error& err)
+    { 
+        SPDLOG_ERROR("Failed to parse config file: {}", err.what());
+        return ErrorCode::FILE_NOT_AVAILABLE;
+    }
+
+    // Helper to get parameter as double (supports int64_t and double)
+    auto get_param_as_double = [](const toml::table* params, const std::string& key, double default_value) -> double {
+        if (auto val = params->get_as<double>(key)) {
+            return **val;
+        }
+        if (auto val_int = params->get_as<int64_t>(key)) {
+            return static_cast<double>(**val_int);
+        }
+        return default_value;
+    };
+    
+    // INIT
+    auto INIT_params = params["INIT"].as_table();
+    auto BATCH_OPT_params = params["BATCH_OPT"].as_table();
+    if (!INIT_params || !BATCH_OPT_params) {
+        SPDLOG_ERROR("OD config file missing required [INIT] or [BATCH_OPT] section: {}",
+                     config_path);
+        return ErrorCode::FILE_NOT_AVAILABLE;
+    }
+    config.init.collection_period = INIT_params->get_as<int64_t>("collection_period")->value_or(config.init.collection_period);
+    config.init.target_samples = INIT_params->get_as<int64_t>("target_samples")->value_or(config.init.target_samples);
+    config.init.max_collection_time = INIT_params->get_as<int64_t>("max_collection_time")->value_or(config.init.max_collection_time);
+    config.init.max_downtime_for_restart = INIT_params->get_as<int64_t>("max_downtime_for_restart_in_minutes")->value_or(config.init.max_downtime_for_restart);
+
+    // BATCH_OPT
+    config.batch_opt.solver_function_tolerance = get_param_as_double(BATCH_OPT_params, "solver_function_tolerance", config.batch_opt.solver_function_tolerance);
+    config.batch_opt.solver_parameter_tolerance = get_param_as_double(BATCH_OPT_params, "solver_parameter_tolerance", config.batch_opt.solver_parameter_tolerance);
+    config.batch_opt.max_iterations = BATCH_OPT_params->get_as<int64_t>("max_iterations")->value_or(config.batch_opt.max_iterations);
+    config.batch_opt.max_run_time_sec = get_param_as_double(BATCH_OPT_params, "max_run_time_sec", config.batch_opt.max_run_time_sec);
+    config.batch_opt.bias_mode = static_cast<BIAS_MODE>(BATCH_OPT_params->get_as<int64_t>("bias_mode")->value_or(static_cast<int64_t>(config.batch_opt.bias_mode)));
+    config.batch_opt.compute_covariance = BATCH_OPT_params->get_as<bool>("compute_covariance")->value_or(config.batch_opt.compute_covariance);
+    config.batch_opt.use_j2   = BATCH_OPT_params->get_as<bool>("use_j2")->value_or(config.batch_opt.use_j2);
+    config.batch_opt.use_drag = BATCH_OPT_params->get_as<bool>("use_drag")->value_or(config.batch_opt.use_drag);
+    config.batch_opt.cd_nominal = get_param_as_double(BATCH_OPT_params, "cd_nominal", config.batch_opt.cd_nominal);
+    config.batch_opt.cd_std     = get_param_as_double(BATCH_OPT_params, "cd_std",     config.batch_opt.cd_std);
+    config.batch_opt.integrator          = static_cast<Integrator>(BATCH_OPT_params->get_as<int64_t>("integrator")->value_or(static_cast<int64_t>(config.batch_opt.integrator)));
+    config.batch_opt.landmark_huber_delta = get_param_as_double(BATCH_OPT_params, "landmark_huber_delta", config.batch_opt.landmark_huber_delta);
+    config.batch_opt.mahal_threshold      = get_param_as_double(BATCH_OPT_params, "mahal_threshold",      config.batch_opt.mahal_threshold);
+    config.batch_opt.max_od_iterations    = static_cast<int>(BATCH_OPT_params->get_as<int64_t>("max_od_iterations")->value_or(static_cast<int64_t>(config.batch_opt.max_od_iterations)));
+    // TODO: safe value checking on each params
+
+    LogConfig();
+    return ErrorCode::OK;
+
+}
+
+
+void OD::LogConfig()
+{
+    SPDLOG_INFO("OD Current Configuration parameters: ");
+
+    SPDLOG_INFO("INIT_config:");
+    SPDLOG_INFO("  collection_period: {}", config.init.collection_period);
+    SPDLOG_INFO("  target_samples: {}", config.init.target_samples);
+    SPDLOG_INFO("  max_collection_time: {}", config.init.max_collection_time);
+
+    SPDLOG_INFO("BATCH_OPT_config:");
+    SPDLOG_INFO("  solver_function_tolerance: {}", config.batch_opt.solver_function_tolerance);
+    SPDLOG_INFO("  solver_parameter_tolerance: {}", config.batch_opt.solver_parameter_tolerance);
+    SPDLOG_INFO("  max_iterations: {}", config.batch_opt.max_iterations);
+    SPDLOG_INFO("  max_run_time_sec: {}", config.batch_opt.max_run_time_sec);
+    SPDLOG_INFO("  bias_mode: {}", static_cast<int>(config.batch_opt.bias_mode));
+    SPDLOG_INFO("  compute_covariance: {}", config.batch_opt.compute_covariance);
+    SPDLOG_INFO("  use_j2: {}", config.batch_opt.use_j2);
+    SPDLOG_INFO("  use_drag: {}", config.batch_opt.use_drag);
+    SPDLOG_INFO("  cd_nominal: {}", config.batch_opt.cd_nominal);
+    SPDLOG_INFO("  cd_std: {}", config.batch_opt.cd_std);
+    SPDLOG_INFO("  integrator: {} ({})", static_cast<int>(config.batch_opt.integrator),
+                config.batch_opt.integrator == Integrator::RK4 ? "RK4" : "Euler");
+    SPDLOG_INFO("  landmark_huber_delta: {}", config.batch_opt.landmark_huber_delta);
+    SPDLOG_INFO("  mahal_threshold: {}", config.batch_opt.mahal_threshold);
+    SPDLOG_INFO("  max_od_iterations: {}", config.batch_opt.max_od_iterations);
+
+}
+
+ODConfigResult ReadODConfig(const std::string& config_path)
+{
+    ODConfigResult result;
+    toml::table params;
+    if (!std::filesystem::exists(config_path)) {
+        SPDLOG_WARN("OD config file not found, using defaults: {}", config_path);
+        return result;
+    }
+
+    try
+    {
+        params = toml::parse_file(config_path);
+    }
+    catch (const toml::parse_error& err)
+    {
+        SPDLOG_ERROR("Failed to parse OD config file: {}", err.what());
+        result.code = ErrorCode::FILE_NOT_AVAILABLE;
+        return result;
+    }
+
+    // Helper to get parameter as double (supports int64_t and double)
+    auto get_param_as_double = [](const toml::table* params, const std::string& key, double default_value) -> double {
+        if (auto val = params->get_as<double>(key)) {
+            return **val;
+        }
+        if (auto val_int = params->get_as<int64_t>(key)) {
+            return static_cast<double>(**val_int);
+        }
+        return default_value;
+    };
+
+    OD_Config& od_config = result.config;
+
+    auto INIT_params      = params["INIT"].as_table();
+    auto BATCH_OPT_params = params["BATCH_OPT"].as_table();
+    if (!INIT_params)      SPDLOG_WARN("OD config missing [INIT] section, using defaults");
+    if (!BATCH_OPT_params) SPDLOG_WARN("OD config missing [BATCH_OPT] section, using defaults");
+
+    if (INIT_params) {
+        od_config.init.collection_period        = INIT_params->get_as<int64_t>("collection_period")->value_or(od_config.init.collection_period);
+        od_config.init.target_samples           = INIT_params->get_as<int64_t>("target_samples")->value_or(od_config.init.target_samples);
+        od_config.init.max_collection_time      = INIT_params->get_as<int64_t>("max_collection_time")->value_or(od_config.init.max_collection_time);
+        od_config.init.max_downtime_for_restart = INIT_params->get_as<int64_t>("max_downtime_for_restart_in_minutes")->value_or(od_config.init.max_downtime_for_restart);
+    }
+
+    if (BATCH_OPT_params) {
+        od_config.batch_opt.solver_parameter_tolerance = get_param_as_double(BATCH_OPT_params, "solver_parameter_tolerance", od_config.batch_opt.solver_parameter_tolerance);
+        od_config.batch_opt.solver_function_tolerance  = get_param_as_double(BATCH_OPT_params, "solver_function_tolerance",  od_config.batch_opt.solver_function_tolerance);
+        od_config.batch_opt.max_iterations    = BATCH_OPT_params->get_as<int64_t>("max_iterations")->value_or(od_config.batch_opt.max_iterations);
+        od_config.batch_opt.max_run_time_sec  = get_param_as_double(BATCH_OPT_params, "max_run_time_sec", od_config.batch_opt.max_run_time_sec);
+        od_config.batch_opt.bias_mode         = static_cast<BIAS_MODE>(BATCH_OPT_params->get_as<int64_t>("bias_mode")->value_or(static_cast<int64_t>(od_config.batch_opt.bias_mode)));
+        od_config.batch_opt.compute_covariance = BATCH_OPT_params->get_as<bool>("compute_covariance")->value_or(od_config.batch_opt.compute_covariance);
+        od_config.batch_opt.use_j2            = BATCH_OPT_params->get_as<bool>("use_j2")->value_or(od_config.batch_opt.use_j2);
+        od_config.batch_opt.use_drag          = BATCH_OPT_params->get_as<bool>("use_drag")->value_or(od_config.batch_opt.use_drag);
+        od_config.batch_opt.cd_nominal        = get_param_as_double(BATCH_OPT_params, "cd_nominal", od_config.batch_opt.cd_nominal);
+        od_config.batch_opt.cd_std            = get_param_as_double(BATCH_OPT_params, "cd_std",     od_config.batch_opt.cd_std);
+        od_config.batch_opt.integrator           = static_cast<Integrator>(BATCH_OPT_params->get_as<int64_t>("integrator")->value_or(static_cast<int64_t>(od_config.batch_opt.integrator)));
+        od_config.batch_opt.landmark_huber_delta = get_param_as_double(BATCH_OPT_params, "landmark_huber_delta", od_config.batch_opt.landmark_huber_delta);
+        od_config.batch_opt.mahal_threshold      = get_param_as_double(BATCH_OPT_params, "mahal_threshold",      od_config.batch_opt.mahal_threshold);
+        od_config.batch_opt.max_od_iterations    = static_cast<int>(BATCH_OPT_params->get_as<int64_t>("max_od_iterations")->value_or(static_cast<int64_t>(od_config.batch_opt.max_od_iterations)));
+    }
+
+    // Print the configuration
+    SPDLOG_INFO("OD Configuration parameters set");
+
+    result.code = ErrorCode::OK;
+    return result;
+}
+===== FSW OD measurements =====
+#include "navigation/od_measurements.hpp"
+#include "navigation/quaternion.hpp"
+#include "navigation/pose_dynamics.hpp"  // GyroMeasurementIdx
+#include <casadi/casadi.hpp>
+#include "spdlog/spdlog.h"
+
+using casadi::DM;
+using casadi::MX;
+
+MX pseudo_huber_cost(const MX& res, double M)
+{
+    MX d_sq = dot(res, res);
+    return 2.0 * M * M * (sqrt(1.0 + d_sq / (M * M)) - 1.0);
+}
+
+MX landmark_residual_casadi(
+    const MX& r,
+    const MX& q,
+    const DM& lmk_pos,
+    const DM& bearing_meas,
+    double sigma)
+{
+    MX diff         = MX(lmk_pos) - r;
+    MX dist         = sqrt(dot(diff, diff) + 1e-6);
+    MX bearing_eci  = diff / dist;
+    MX bearing_body = quat_inv_rotate_xyzw(q, bearing_eci);
+    return (bearing_body - MX(bearing_meas)) / sigma;
+}
+
+ErrorCode ODMeasurements::Validate() const
+{
+    bool valid = true;
+    const auto N = landmark_measurements.rows();
+    const auto M = gyro_measurements.rows();
+
+    // ── Emptiness ─────────────────────────────────────────────────────────────
+    if (N == 0) {
+        spdlog::error("ODMeasurements::Validate: landmark_measurements is empty.");
+        valid = false;
+    }
+    if (M == 0) {
+        spdlog::error("ODMeasurements::Validate: gyro_measurements is empty.");
+        valid = false;
+    }
+    if (!valid) {
+        SPDLOG_ERROR("ODMeasurements::Validate: emptiness check failed.");
+        return ErrorCode::ODMEAS_NOT_VALID;
+    }
+
+    if (N < OD_MIN_LANDMARK_MEASUREMENTS) {
+        spdlog::error("ODMeasurements::Validate: only {} landmark measurement row(s); need at least {}.",
+                      N, OD_MIN_LANDMARK_MEASUREMENTS);
+        return ErrorCode::ODMEAS_NOT_VALID;
+    }
+
+    // ── Column counts ──────────────────────────────────────────────────────────
+    if (landmark_measurements.cols() != LandmarkMeasurementIdx::LANDMARK_COUNT) {
+        spdlog::error("ODMeasurements::Validate: landmark_measurements has {} columns, expected {}.",
+                      landmark_measurements.cols(), LandmarkMeasurementIdx::LANDMARK_COUNT);
+        valid = false;
+    }
+    if (gyro_measurements.cols() != GyroMeasurementIdx::GYRO_MEAS_COUNT) {
+        spdlog::error("ODMeasurements::Validate: gyro_measurements has {} columns, expected {}.",
+                      gyro_measurements.cols(), GyroMeasurementIdx::GYRO_MEAS_COUNT);
+        valid = false;
+    }
+
+    // ── Row count consistency ──────────────────────────────────────────────────
+    if (group_starts.rows() != N) {
+        spdlog::error("ODMeasurements::Validate: group_starts has {} rows but "
+                      "landmark_measurements has {}.",
+                      group_starts.rows(), N);
+        valid = false;
+    }
+    if (landmark_uncertainties.size() != N) {
+        spdlog::error("ODMeasurements::Validate: landmark_uncertainties has {} elements but "
+                      "landmark_measurements has {} rows.",
+                      landmark_uncertainties.size(), N);
+        valid = false;
+    }
+    if (!valid) {
+        SPDLOG_ERROR("ODMeasurements::Validate: row count consistency check failed.");
+        return ErrorCode::ODMEAS_NOT_VALID;
+    }
+
+    // ── Group starts ───────────────────────────────────────────────────────────
+    if (!group_starts(0)) {
+        spdlog::error("ODMeasurements::Validate: group_starts(0) is false; "
+                      "the first measurement must open a group.");
+        valid = false;
+    }
+
+    // ── Sigma sanity: 0 → divide-by-zero in cost functor; NaN/inf → NaN residuals ──
+    {
+        int bad = 0;
+        for (Eigen::Index i = 0; i < N; ++i)
+            if (!(landmark_uncertainties(i) > 0.0)) ++bad;
+        if (bad == N) {
+            spdlog::error("ODMeasurements::Validate: all {} sigma values are invalid "
+                          "(zero/nan/inf). Check camera calibration (fx/fy) in the config file.", N);
+            valid = false;
+        } else if (bad > 0) {
+            spdlog::warn("ODMeasurements::Validate: {}/{} sigma values are invalid (zero/nan/inf).",
+                         bad, N);
+        }
+    }
+
+    // ── Temporal range and overlap ─────────────────────────────────────────────
+    {
+        const double lm_t0 = landmark_measurements(0,   LandmarkMeasurementIdx::LANDMARK_TIMESTAMP);
+        const double lm_t1 = landmark_measurements(N-1, LandmarkMeasurementIdx::LANDMARK_TIMESTAMP);
+        const double gy_t0 = gyro_measurements(0,   GyroMeasurementIdx::GYRO_MEAS_TIMESTAMP);
+        const double gy_t1 = gyro_measurements(M-1, GyroMeasurementIdx::GYRO_MEAS_TIMESTAMP);
+
+        spdlog::info("ODMeasurements: landmarks [{:.3f}, {:.3f}] J2000 s ({:.1f} s span); "
+                     "gyro [{:.3f}, {:.3f}] J2000 s ({:.1f} s span).",
+                     lm_t0, lm_t1, lm_t1 - lm_t0, gy_t0, gy_t1, gy_t1 - gy_t0);
+
+        if (lm_t0 > gy_t1 || gy_t0 > lm_t1) {
+            spdlog::error("ODMeasurements::Validate: no temporal overlap — "
+                          "landmarks [{:.3f}, {:.3f}] vs gyro [{:.3f}, {:.3f}]. "
+                          "Verify both files are from the same session.",
+                          lm_t0, lm_t1, gy_t0, gy_t1);
+            valid = false;
+        } else if (lm_t0 < gy_t0 || lm_t1 > gy_t1) {
+            spdlog::warn("ODMeasurements::Validate: some landmark timestamps fall outside the "
+                         "gyro window ([{:.3f},{:.3f}] vs [{:.3f},{:.3f}]) — "
+                         "will be snapped to nearest gyro timestamp.",
+                         lm_t0, lm_t1, gy_t0, gy_t1);
+        }
+    }
+
+    // ── Landmark timestamps non-decreasing ────────────────────────────────────
+    for (Eigen::Index i = 1; i < N; ++i) {
+        if (landmark_measurements(i,   LandmarkMeasurementIdx::LANDMARK_TIMESTAMP) <
+            landmark_measurements(i-1, LandmarkMeasurementIdx::LANDMARK_TIMESTAMP)) {
+            spdlog::error("ODMeasurements::Validate: landmark timestamps not non-decreasing "
+                          "at row {}: {:.6f} < {:.6f}.",
+                          i,
+                          landmark_measurements(i,   LandmarkMeasurementIdx::LANDMARK_TIMESTAMP),
+                          landmark_measurements(i-1, LandmarkMeasurementIdx::LANDMARK_TIMESTAMP));
+            valid = false;
+            break;
+        }
+    }
+
+    // ── Gyro timestamps strictly increasing ───────────────────────────────────
+    for (Eigen::Index i = 1; i < M; ++i) {
+        if (gyro_measurements(i,   GyroMeasurementIdx::GYRO_MEAS_TIMESTAMP) <=
+            gyro_measurements(i-1, GyroMeasurementIdx::GYRO_MEAS_TIMESTAMP)) {
+            spdlog::error("ODMeasurements::Validate: gyro timestamps not strictly increasing "
+                          "at row {}: {:.6f} <= {:.6f}.",
+                          i,
+                          gyro_measurements(i,   GyroMeasurementIdx::GYRO_MEAS_TIMESTAMP),
+                          gyro_measurements(i-1, GyroMeasurementIdx::GYRO_MEAS_TIMESTAMP));
+            valid = false;
+            break;
+        }
+    }
+
+    if (!valid) {
+        SPDLOG_ERROR("ODMeasurements::Validate: validation failed.");
+        return ErrorCode::ODMEAS_NOT_VALID;
+    }
+
+    // ── Informational summary (only reached when valid) ────────────────────────
+    {
+        int num_groups = 0;
+        for (Eigen::Index i = 0; i < N; ++i) if (group_starts(i)) ++num_groups;
+        spdlog::info("ODMeasurements: {} landmark rows, {} groups, {} gyro rows.",
+                     N, num_groups, M);
+    }
+
+    return ErrorCode::OK;
+}
+===== FSW navigation headers =====
+FSW-Payload/include/navigation/od_measurements.hpp
+----- FSW-Payload/include/navigation/od_measurements.hpp
+#ifndef OD_MEASUREMENTS_HPP
+#define OD_MEASUREMENTS_HPP
+
+#include "core/errors.hpp"
+#include <eigen3/Eigen/Dense>
+
+inline constexpr int OD_MIN_LANDMARK_MEASUREMENTS = 4;
+
+namespace casadi {
+template<typename Scalar>
+class Matrix;
+using DM = Matrix<double>;
+class MX;
+}
+
+// ── Landmark column index and cost functor ────────────────────────────────────
+enum LandmarkMeasurementIdx {
+    LANDMARK_TIMESTAMP = 0,
+    BEARING_VEC_X      = 1,
+    BEARING_VEC_Y      = 2,
+    BEARING_VEC_Z      = 3,
+    LANDMARK_POS_X     = 4,
+    LANDMARK_POS_Y     = 5,
+    LANDMARK_POS_Z     = 6,
+    LANDMARK_COUNT     = 7
+};
+
+casadi::MX landmark_residual_casadi(
+    const casadi::MX& r,
+    const casadi::MX& q,
+    const casadi::DM& lmk_pos,
+    const casadi::DM& bearing_meas,
+    double sigma);
+
+// Pseudo-Huber scalar cost for a 3-vector residual (already σ-normalised).
+// φ(d) = 2M²(√(1 + d²/M²) − 1)  where d = ‖res‖
+// Quadratic near zero, linear for d ≫ M.  Matches L2 gradient at d=0.
+casadi::MX pseudo_huber_cost(const casadi::MX& res, double M);
+
+// ── Measurement bundle for solve_batch_opt ────────────────────────────────────
+struct ODMeasurements
+{
+    Eigen::MatrixXd                          landmark_measurements;  // Nx7
+    Eigen::Matrix<bool, Eigen::Dynamic, 1>   group_starts;           // Nx1
+    Eigen::MatrixXd                          gyro_measurements;      // Mx4
+    Eigen::VectorXd                          landmark_uncertainties; // Nx1, one sigma per row
+
+    // Returns ErrorCode::OK on success, ErrorCode::ODMEAS_NOT_VALID on failure.
+    ErrorCode Validate() const;
+};
+
+#endif // OD_MEASUREMENTS_HPP
+FSW-Payload/include/navigation/trajectory_initializer.hpp
+----- FSW-Payload/include/navigation/trajectory_initializer.hpp
+#ifndef TRAJECTORY_INITIALIZER_HPP
+#define TRAJECTORY_INITIALIZER_HPP
+
+#include "navigation/batch_optimization.hpp"
+#include <string>
+#include <vector>
+
+// Computes an initial trajectory guess from landmark measurements and IMU data.
+//
+// Position is initialized from the mean ECI direction of landmarks per group,
+// scaled to Earth radius + 600 km. Attitude is estimated per group via Wahba's
+// problem (SVD) on bearing-to-ECI vector pairs. Velocity is derived from finite
+// differences of position. Gyro bias is estimated by differentiating the attitude
+// and comparing against the measured angular rate.
+//
+// Intermediate results are accessible via state_estimates(). write_csv() writes
+// the full trajectory in the same column format as state_estimates.csv for easy
+// overlay comparison in plot_batch_opt.py.
+class TrajectoryInitializer {
+public:
+    TrajectoryInitializer(
+        const std::vector<double>&  state_timestamps,
+        const LandmarkMeasurements& landmark_measurements,
+        const LandmarkGroupStarts&  landmark_group_starts,
+        BIAS_MODE                   bias_mode,
+        const GyroMeasurements&     gyro_measurements);
+
+    const StateEstimates& state_estimates() const { return state_estimates_; }
+
+    // Writes initial_trajectory.csv into results_dir with the same header and
+    // column layout as state_estimates.csv.
+    void write_csv(const std::string& results_dir) const;
+
+private:
+    StateEstimates state_estimates_;
+};
+
+#endif // TRAJECTORY_INITIALIZER_HPP
+FSW-Payload/include/navigation/quaternion.hpp
+----- FSW-Payload/include/navigation/quaternion.hpp
+#ifndef QUATERNION_HPP
+#define QUATERNION_HPP
+
+#include <casadi/casadi.hpp>
+#include <eigen3/Eigen/Dense>
+
+typedef Eigen::Vector3d Vector;
+typedef Eigen::Vector4d Quaternion;
+typedef Eigen::Matrix3d Matrix3x3;
+typedef Eigen::Matrix4d Matrix4x4;
+
+/**
+ * @brief Generates a skew-symmetric matrix from a 3D vector.
+ * 
+ * @param omega Input 3D vector representing angular velocity.
+ * @return Matrix3x3 Skew-symmetric matrix.
+ */
+Matrix3x3 SkewSymmetric(const Vector& omega);
+
+/**
+ * @brief Constructs the left quaternion multiplication matrix.
+ * 
+ * @param q Input quaternion.
+ * @return Matrix4x4 Left-multiplication matrix.
+ */
+Matrix4x4 L(const Quaternion& q);
+
+/**
+ * @brief Constructs the right quaternion multiplication matrix.
+ * 
+ * @param q Input quaternion.
+ * @return Matrix4x4 Right-multiplication matrix.
+ */
+Matrix4x4 R(const Quaternion& q);
+
+/**
+ * @brief Computes the conjugate of a quaternion. Does not normalize the input.
+ * 
+ * @param q Input quaternion.
+ * @return Quaternion Conjugate quaternion.
+ */
+Quaternion Conj(const Quaternion& q);
+
+/**
+ * @brief Converts a quaternion to a Modified Rodrigues Parameter (MRP) vector.
+ * 
+ * This function normalizes the input quaternion before performing the conversion.
+ * The input quaternion must be non-zero to avoid division by zero during normalization.
+ * It is the caller's responsibility to ensure that the input quaternion is non-zero.
+ * 
+ * @param q Input quaternion, must be non-zero (can be unnormalized).
+ * @return Vector MRP vector representing the same rotation.
+ * 
+ * @note Passing a zero quaternion will result in undefined behavior. The function uses assertions
+ *       to check for a zero quaternion during development but does not throw exceptions.
+ */
+Vector MRPFromQuat(const Quaternion& q);
+
+/**
+ * @brief Multiplies two quaternions.
+ * 
+ * @param q1 First quaternion.
+ * @param q2 Second quaternion.
+ * @return Quaternion Resulting quaternion from the product.
+ */
+Quaternion QuatProduct(const Quaternion& q1, const Quaternion& q2);
+
+/**
+ * @brief Performs Spherical Linear Interpolation (SLERP) between two quaternions.
+ * 
+ * This function computes the interpolated quaternion between two given quaternions `q1` and `q2` at
+ * a parameter `t`, where `t` ranges from 0 to 1. The interpolation is done along the shortest path
+ * on the 4D hypersphere to ensure smooth rotation transitions.
+ * 
+ * The function adjusts for the sign of the dot product to ensure the shortest path is taken.
+ * For quaternions that are nearly parallel, linear interpolation is used to avoid numerical issues.
+ * 
+ * @param q1 Starting quaternion (must be a unit quaternion).
+ * @param q2 Ending quaternion (must be a unit quaternion).
+ * @param t Interpolation factor (0 <= t <= 1).
+ * @return Quaternion Interpolated unit quaternion representing the rotation at parameter `t`.
+ * 
+ * @note Both input quaternions must be normalized (unit quaternions). The function normalizes the
+ *       output quaternion before returning it. It is the caller's responsibility to ensure that `t`
+ *       is within the range [0, 1].
+ * @note If `t` is outside the range [0, 1], the function will extrapolate, which may not be desired.
+ */
+Quaternion Slerp(const Quaternion& q1, const Quaternion& q2, double t);
+
+
+/**
+ * @brief Computes the quaternion derivative for kinematic equations given angular velocity.
+ * 
+ * This function calculates the time derivative of a quaternion `q` representing orientation,
+ * based on the provided angular velocity vector `angvel`. The angular velocity should be expressed
+ * in the same frame as the quaternion.
+ * 
+ * The derivative is computed using the quaternion kinematic equation:
+ * 
+ *     dq/dt = 0.5 * L(q) * omega_quat
+ * 
+ * where `L(q)` is the left quaternion multiplication matrix of `q`, and `omega_quat` is a pure
+ * quaternion (scalar part zero) constructed from the angular velocity vector.
+ * 
+ * @param q Input quaternion representing orientation (must be a unit quaternion).
+ * @param angvel Angular velocity vector [rad/s].
+ * @return Quaternion Time derivative of the quaternion.
+ * 
+ * @note The input quaternion must be normalized. The function assumes that the angular velocity is
+ *       expressed in the same coordinate frame as the quaternion.
+ */
+Quaternion QuaternionKinematics(const Quaternion& q, const Vector& angvel);
+
+// CasADi quaternion helpers use the batch-optimization convention [x, y, z, w].
+casadi::MX quat_product_xyzw(const casadi::MX& p, const casadi::MX& q);
+casadi::MX quat_conjugate_xyzw(const casadi::MX& q);
+casadi::MX angle_axis_to_quat_xyzw(const casadi::MX& angle_axis);
+casadi::MX quat_inv_rotate_xyzw(const casadi::MX& q, const casadi::MX& v);
+Eigen::Matrix<double, 4, 3> quat_tangent_basis_xyzw(double qx, double qy,
+                                                    double qz, double qw);
+
+#endif
+FSW-Payload/include/navigation/README.md
+----- FSW-Payload/include/navigation/README.md
+## Navigation Pipeline
+
+TODOFSW-Payload/include/navigation/pose_dynamics.hpp
+----- FSW-Payload/include/navigation/pose_dynamics.hpp
+#ifndef POSE_DYNAMICS_HPP
+#define POSE_DYNAMICS_HPP
+
+#include <casadi/casadi.hpp>
+#include "navigation/od.hpp"
+
+// Gyro measurements are treated as inputs to the attitude dynamics
+enum GyroMeasurementIdx {
+    GYRO_MEAS_TIMESTAMP = 0,
+    ANG_VEL_X = 1,
+    ANG_VEL_Y = 2,
+    ANG_VEL_Z = 3,
+    GYRO_MEAS_COUNT = 4
+};
+
+casadi::MX keplerian_accel(const casadi::MX& r);
+casadi::MX j2_accel(const casadi::MX& r);
+casadi::MX drag_accel(const casadi::MX& r, const casadi::MX& v, const casadi::MX& cd);
+casadi::MX linear_dynamics(const casadi::MX& r, const casadi::MX& v, const casadi::MX& uma,
+                            bool use_j2, bool use_drag, const casadi::MX& cd);
+casadi::MX linear_dynamics_constraint(
+    const casadi::MX& r0, const casadi::MX& v0,
+    const casadi::MX& r1, const casadi::MX& v1,
+    const casadi::MX& uma, double dt, Integrator integrator,
+    bool use_j2, bool use_drag = false,
+    const casadi::MX& cd = casadi::MX(2.2));
+casadi::MX angular_dynamics_residual_fix_bias(
+    const casadi::MX& q0, const casadi::MX& q1,
+    const casadi::DM& gyro_w, const casadi::MX& bias,
+    double dt, double quat_std);
+
+#endif // POSE_DYNAMICS_HPP
+FSW-Payload/include/navigation/utils.hpp
+----- FSW-Payload/include/navigation/utils.hpp
+#ifndef UTILS_HPP
+#define UTILS_HPP
+
+#include <cstdint>
+
+#include <eigen3/Eigen/Core>
+#include <eigen3/Eigen/Dense>
+#include <opencv2/calib3d.hpp>
+#include "SpiceUsr.h"
+
+/**
+ * @brief Converts Unix UTC seconds to SPICE ET/TDB seconds past J2000.
+ *
+ * This is the time scale expected by CSPICE frame transform routines such as
+ * pxform_c and sxform_c.
+ *
+ * @param unixSeconds seconds past the Unix epoch (1970-01-01T00:00:00 UTC)
+ * @return SPICE ET/TDB seconds past J2000
+ */
+double unixToJ2000(double unixSeconds);
+
+/**
+ * @brief Compute the skew-symmetric, 3x3 matrix corresponding to
+ * cross product with v
+ *
+ * @param v vector on the left side of the hypothetical cross product
+ * @return Matrix_3x3 3x3 skew symmetric matrix
+ */
+Eigen::Matrix3d toSkew(const Eigen::Vector3d &v);
+
+
+// CSPICE COORDINATE TRANSFORMS
+
+/**
+ * @brief Load all kernels from datapaths necessary for SPICE
+ *
+ * TOREAD : types of kernel according to SPICE [read https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/kernel.html#Kernel%20Types]
+ */
+void loadAllKernels();
+
+/**
+ * @brief Cast a double[3][3] into an Eigen <double, 3, 3> matrix
+ *
+ * @param M SpiceDouble 3x3 matrix
+ * @return R Eigen 3x3 matrix
+ */
+Eigen::Matrix3d Cspice2Eigen(SpiceDouble M[3][3]);
+
+/**
+ * @brief Computes the rotation matrix from ECI to ECEF at a given time
+ *
+ * @param t_J2000 - seconds past J2000 i.e., seconds past Jan 1st 2000, 12:00:00 PM
+ * @return R Eigen 3x3 matrix representing roation from ECI to ECEF
+ */
+Eigen::Matrix3d ECI2ECEF(double t_J2000);
+
+/**
+ * @brief Computes the rotation matrix from ECEF to ECI at a given time
+ *
+ * @param t_J2000 - seconds past J2000 i.e., seconds past Jan 1st 2000, 12:00:00 PM
+ * @return R Eigen 3x3 matrix representing roation from ECEF to ECI
+ */
+Eigen::Matrix3d ECEF2ECI(double t_J2000);
+
+/**
+ * @brief Transforms a vector in ECEF frame to latitudinal coordinates
+ *
+ * @param v_ecef - vector in ECEF frame [UNITS : m]
+ * @param geoc - If true, the latitudinal coordinates will be geocentric, if not, geodetic
+ * @return vector in latitudinal coordinates (r, lon, lat) [m, rad, rad] if geocentric
+                                           (alt, lon, lat) [m, rad, rad] if geodetic
+ */
+Eigen::Vector3d ECEF2LAT(Eigen::Vector3d v_ecef, bool geoc);
+
+/**
+ * @brief Transforms a vector in latitudinal coordinates to ECEF frame
+ *
+ * @param v_lat - vector in latitudinal coordinates (r, lon, lat) [m, rad, rad] if geocentric
+                                                  (alt, lon, lat) [m, rad, rad] if geodetic
+ * @param geoc - If true, the latitudinal coordinates will be geocentric, if not, geodetic
+ * @return vector in ECEF frame [UNITS : m]
+ */
+Eigen::Vector3d LAT2ECEF(Eigen::Vector3d v_lat, bool geoc);
+
+/**
+ * @brief Transforms a vector in ECI frame to latitudinal coordinates
+ *
+ * @param v_eci - vector in ECI frame [UNITS : m]
+ * @param geoc - If true, the latitudinal coordinates will be geocentric, if not, geodetic
+ * @param t_J2000 - seconds past J2000
+ * @return vector in latitudinal coordinates (r, lon, lat) [m, rad, rad] if geocentric
+                                           (alt, lon, lat) [m, rad, rad] if geodetic
+ */
+Eigen::Vector3d ECI2LAT(Eigen::Vector3d v_eci, double t_J2000, bool geoc);
+
+/**
+ * @brief Transforms a vector in latitudinal coordinates to ECI frame
+ *
+ * @param v_lat - vector in latitudinal coordinates (r, lon, lat) [m, rad, rad] if geocentric
+                                                  (alt, lon, lat) [m, rad, rad] if geodetic
+ * @param t_J2000 - seconds past J2000
+ * @param geoc - If true, the latitudinal coordinates will be geocentric, if not, geodetic
+ * @return vector in ECI frame [UNITS : m]
+ */
+Eigen::Vector3d LAT2ECI(Eigen::Vector3d v_lat, double t_J2000, bool geoc);
+
+/**
+ * @brief Computes a unit bearing vector in the camera body frame from a pixel coordinate
+ *
+ * @param px - pixel x coordinate
+ * @param py - pixel y coordinate
+ * @param camera_matrix - 3x3 intrinsic camera matrix (CV_64F)
+ * @param dist_coeffs - distortion coefficients (CV_64F)
+ * @return unit bearing vector in camera body frame
+ */
+Eigen::Vector3d PixelToBodyBearing(float px, float py, const cv::Mat& camera_matrix, const cv::Mat& dist_coeffs);
+
+#endif // UTILS_HPP
+FSW-Payload/include/navigation/od.hpp
+----- FSW-Payload/include/navigation/od.hpp
+#ifndef OD_HPP
+#define OD_HPP
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include "navigation/od_measurements.hpp"
+#include "vision/dataset.hpp"
+
+// Forward declaration — full definition in configuration.hpp
+struct CameraCalibration;
+class CameraManager;
+class IMUManager;
+class InferenceManager;
+
+#define OD_DEFAULT_COLLECTION_PERIOD 10
+#define OD_DEFAULT_COLLECTION_SAMPLES 30
+#define DATASET_KEY_OD "OD"
+#define OD_DEFAULT_CONFIG_PATH "config/od.toml"
+
+enum class ODStage : uint8_t
+{
+    DATASET_NOT_AVAILABLE = 0,
+    DATASET_NOT_PROCESSED = 1,
+    DATASET_PROCESSED = 2,
+    MEASUREMENTS_READY = 3,
+    INITIAL_GUESS_CREATED = 4,
+    OD_COMPLETED = 5,
+    FAILED = 6
+};
+
+enum class ODRunStatus : uint8_t
+{
+    NOT_STARTED = 0,
+    RUNNING = 1,
+    COMPLETED = 2,
+    FAILED = 3,
+    CANCELLED = 4
+};
+
+enum class BIAS_MODE : uint8_t
+{
+    NO_BIAS  = 0,  // no gyro bias estimation
+    FIX_BIAS = 1, // fixed/constant gyro bias estimation
+    TV_BIAS  = 2   // time-varying gyro bias estimation
+};
+
+enum Integrator : int
+{
+    EULER = 0,
+    RK4   = 1
+};
+
+
+struct INIT_config
+{
+    uint32_t collection_period;
+    uint32_t target_samples;
+    uint32_t max_collection_time;
+    uint32_t max_downtime_for_restart; 
+
+    INIT_config();
+};
+
+struct BATCH_OPT_config
+{
+    double solver_function_tolerance;
+    double solver_parameter_tolerance;
+    uint32_t max_iterations;
+    double max_run_time_sec;
+    BIAS_MODE bias_mode;
+    bool compute_covariance;
+    bool use_j2;
+    bool use_drag;
+    double cd_nominal;
+    double cd_std;
+    Integrator integrator;
+    double landmark_huber_delta = 3.0;  // Pseudo-Huber M parameter [σ units]
+    double mahal_threshold      = 5.0;  // Mahalanobis rejection threshold [σ units]
+    int    max_od_iterations    = 10;   // Max outlier-rejection loop iterations
+    BATCH_OPT_config();
+};
+
+struct OD_Config
+{
+    INIT_config init;
+    BATCH_OPT_config batch_opt;
+
+    OD_Config();
+};
+
+struct ODRequest
+{
+    std::string dataset_folder;
+    std::string od_config_path = OD_DEFAULT_CONFIG_PATH;
+    std::string system_config_path = "config/config.toml";
+    // When set, takes precedence over od_config_path entirely.
+    std::optional<OD_Config> od_config_override;
+    DatasetConfig dataset_config = {
+        OD_DEFAULT_COLLECTION_PERIOD,
+        OD_DEFAULT_COLLECTION_SAMPLES,
+        CAPTURE_MODE::PERIODIC_LDMK,
+        0,
+        IMU_COLLECTION_MODE::GYRO_ONLY,
+        1,
+        1.0f,
+        ProcessingStage::LDNeted
+    };
+};
+
+struct ODResult
+{
+    ErrorCode code = ErrorCode::OK;
+    ODStage stage = ODStage::DATASET_NOT_AVAILABLE;
+    std::string dataset_folder;
+    std::string results_dir;
+};
+
+struct ODConfigResult
+{
+    ErrorCode code = ErrorCode::OK;
+    OD_Config config;
+};
+
+struct ODMeasurementsResult
+{
+    ErrorCode code = ErrorCode::OK;
+    ODMeasurements measurements;
+};
+
+class OD
+{
+
+public:
+
+    OD(const std::string& config_path = OD_DEFAULT_CONFIG_PATH);
+    ~OD();
+
+    // Quick pre-check: does the dataset folder contain enough LDNeted frames with
+    // landmarks and IMU data that spans the collection window?
+    // Returns false (with reason logged) if OD is clearly infeasible.
+    bool IsODPossible(const std::string& dataset_folder) const;
+
+    // Convert a completed dataset folder into the measurement matrices required by the
+    // batch optimizer. Infers the LD model version from the dataset frame metadata.
+    // calibration  — shared intrinsics + per-camera cam_to_body rotation matrices
+    // Returns ErrorCode::OK on success; otherwise returns a diagnostic error code.
+    ErrorCode DatasetPrepare(const std::string& dataset_folder,
+                             const CameraCalibration& calibration);
+
+private:
+    // Configurations
+    OD_Config config;
+
+    // Read the config yaml file 
+    ErrorCode ReadConfig(const std::string& config_path);
+    void LogConfig();
+
+    ODMeasurements measurements_;
+    bool measurements_ready_ = false;
+};
+
+ODConfigResult ReadODConfig(const std::string& config_path);
+ODStage InspectDatasetForOD(const std::string& dataset_folder);
+ODMeasurementsResult LoadODMeasurementsFromDataset(const std::string& dataset_folder);
+ODResult RunODOnDataset(const ODRequest& request);
+ODResult RunODPipeline(const ODRequest& request,
+                       CameraManager& cam_manager,
+                       IMUManager& imu_manager,
+                       InferenceManager& inference_manager);
+
+
+
+#endif // OD_HPP
+FSW-Payload/include/navigation/batch_optimization.hpp
+----- FSW-Payload/include/navigation/batch_optimization.hpp
+#ifndef BATCH_OPTIMIZATION_HPP
+#define BATCH_OPTIMIZATION_HPP
+
+#include "navigation/od_measurements.hpp"
+#include "navigation/od.hpp"
+#include "navigation/pose_dynamics.hpp"
+#include <array>
+#include <cstdint>
+#include <string>
+#include <utility>
+
+#include <eigen3/Eigen/Dense>
+
+enum class BatchOptimizationState {
+    NOT_STARTED = 0,
+    RUNNING = 1,
+    COMPLETED = 2,
+    FAILED = 3
+};
+
+enum StateEstimateIdx {
+    STATE_ESTIMATE_TIMESTAMP = 0,
+    POS_X = 1,
+    POS_Y = 2,
+    POS_Z = 3,
+    VEL_X = 4,
+    VEL_Y = 5,
+    VEL_Z = 6,
+    QUAT_X = 7,
+    QUAT_Y = 8,
+    QUAT_Z = 9,
+    QUAT_W = 10,
+    GYRO_BIAS_X = 11,
+    GYRO_BIAS_Y = 12,
+    GYRO_BIAS_Z = 13,
+    STATE_ESTIMATE_COUNT = 14
+};
+
+// Column indexes shared by the covariance matrix and the dynamics residuals matrix.
+// Both are (N-1)×13 (or N×13 for covariance) with one column per tangent-space component.
+enum StateResIdx {
+    RES_TIMESTAMP      = 0,
+    RES_POS_X          = 1,
+    RES_POS_Y          = 2,
+    RES_POS_Z          = 3,
+    RES_VEL_X          = 4,
+    RES_VEL_Y          = 5,
+    RES_VEL_Z          = 6,
+    RES_ROT_X          = 7,
+    RES_ROT_Y          = 8,
+    RES_ROT_Z          = 9,
+    RES_GYRO_BIAS_X    = 10,
+    RES_GYRO_BIAS_Y    = 11,
+    RES_GYRO_BIAS_Z    = 12,
+    STATE_RES_COUNT    = 13
+};
+
+// Column indexes for the landmark measurement residuals matrix (M rows, one per measurement)
+enum LandmarkResIdx {
+    LANDMARK_RES_X     = 0,
+    LANDMARK_RES_Y     = 1,
+    LANDMARK_RES_Z     = 2,
+    LANDMARK_RES_COUNT = 3
+};
+
+using LandmarkMeasurements   = Eigen::Matrix<double, Eigen::Dynamic, LandmarkMeasurementIdx::LANDMARK_COUNT, Eigen::RowMajor>;
+using LandmarkGroupStarts    = Eigen::Matrix<bool,   Eigen::Dynamic, 1, Eigen::ColMajor>;
+using GyroMeasurements       = Eigen::Matrix<double, Eigen::Dynamic, GyroMeasurementIdx::GYRO_MEAS_COUNT, Eigen::RowMajor>;
+using StateEstimates         = Eigen::Matrix<double, Eigen::Dynamic, StateEstimateIdx::STATE_ESTIMATE_COUNT, Eigen::RowMajor>;
+using ResidualsOrCovariances = Eigen::Matrix<double, Eigen::Dynamic, StateResIdx::STATE_RES_COUNT, Eigen::RowMajor>;
+using DynamicsResiduals      = Eigen::Matrix<double, Eigen::Dynamic, StateResIdx::STATE_RES_COUNT, Eigen::RowMajor>;
+using LandmarkResiduals      = Eigen::Matrix<double, Eigen::Dynamic, LandmarkResIdx::LANDMARK_RES_COUNT, Eigen::RowMajor>;
+using idx_t = Eigen::Index;
+
+// Initial guess seeded from a previous solve result (bypasses TrajectoryInitializer).
+struct WarmStartData {
+    StateEstimates  state_estimates;       // Nx14 (r, v, q, gyro_bias columns)
+    Eigen::MatrixXd uma_accelerations;    // (N-1)x3  [km/s²]
+    double          cd = 2.2;
+};
+
+struct StateTimestampsResult {
+    ErrorCode            code = ErrorCode::OK;
+    std::vector<double>  state_timestamps;
+    std::vector<idx_t>   landmark_group_indices;
+};
+
+struct SolverSummaryInfo {
+    std::string return_status = "not_solved";  // IPOPT return status string
+    int    iter_count  = 0;
+    double final_cost  = 0.0;
+    double solve_time_ms = -1.0;
+    int    n_active_landmarks = 0;             // landmark rows fed to this IPOPT call
+    int    n_rejected = 0;                     // landmarks rejected after this call
+};
+
+struct BatchOptResult {
+    ErrorCode              code = ErrorCode::OK;
+    StateEstimates         initial_trajectory;  // Nx14 pre-solve initial guess
+    StateEstimates         state_estimates;
+    ResidualsOrCovariances covariance;          // Nx13 per StateResIdx; 0 rows if unavailable
+    DynamicsResiduals      dynamics_residuals;  // (N-1)x13 per StateResIdx
+    LandmarkResiduals      landmark_residuals;  // Mx3 per LandmarkResIdx (M = total input landmarks)
+    Eigen::MatrixXd        uma_accelerations;   // (N-1)x3  [km/s²], used for warm-starting next iteration
+    SolverSummaryInfo      solver_summary;
+    std::array<double, 3>  gyro_bias_fixed = {0.0, 0.0, 0.0};  // [rad/s], valid when FIX_BIAS
+    double                 cd          = 2.2;                   // [-], valid when use_drag
+    bool                   cd_estimated = false;
+    bool                   covariance_computed = false;
+    bool                   covariance_timed_out = false;
+    double                 covariance_time_ms = -1.0;           // valid when covariance was requested
+    std::array<double, 3>  gyro_bias_var = {0.0, 0.0, 0.0};   // variance [rad/s]², valid when covariance_computed
+    double                 cd_var = 0.0;                        // variance [-]², valid when cd_estimated && covariance_computed
+    std::vector<int8_t>       lmk_outlier_flags;                // length = N_total input landmarks; 0=inlier, 1=outlier
+    int                       n_od_solver_calls = 1;            // number of IPOPT calls (1 for single-shot)
+    int                       n_lmk_outliers   = 0;            // number of rejected landmark rows
+    std::vector<SolverSummaryInfo> iteration_summaries;        // one entry per outlier-rejection iteration
+};
+
+StateTimestampsResult
+get_state_timestamps(const LandmarkMeasurements& landmark_measurements,
+                     const LandmarkGroupStarts& landmark_group_starts,
+                     const GyroMeasurements& gyro_measurements,
+                     const idx_t num_groups);
+
+// Single-shot batch NLP orbit determination (IPOPT).
+// Returns BatchOptResult::code == ErrorCode::OK on success. On failure the code
+// is set to ODMEAS_NOT_VALID, BATCH_OPT_NO_CONVERGENCE, BATCH_OPT_SOLVER_FAILED,
+// or BATCH_OPT_INVALID_OUTPUT. If enabled in config, covariance contains the
+// diagonal tangent-space covariance per StateResIdx.
+// warm_start: if non-null, seeds IPOPT from a previous solve result instead of
+// running TrajectoryInitializer.
+BatchOptResult solve_batch_opt(const ODMeasurements& measurements,
+                               BATCH_OPT_config bo_config,
+                               const WarmStartData* warm_start = nullptr);
+
+// Iterative batch OD with per-landmark Mahalanobis-distance outlier rejection.
+// Calls solve_batch_opt in a loop, rejecting landmarks whose ‖residual‖ exceeds
+// bo_config.mahal_threshold, until no outliers remain or bo_config.max_od_iterations
+// is reached. Covariance (if requested) is computed only on the final converged solve.
+// landmark_residuals in the result spans all N_total input landmarks (inlier residuals
+// at their original positions; outlier rows re-evaluated at the final solution).
+// lmk_outlier_flags, n_od_solver_calls, and n_lmk_outliers are populated.
+BatchOptResult solve_batch_opt_with_outlier_rejection(
+    const ODMeasurements& measurements,
+    BATCH_OPT_config bo_config);
+
+#endif // BATCH_OPTIMIZATION_HPP

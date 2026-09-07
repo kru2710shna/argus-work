@@ -1,0 +1,9 @@
+capture_start_time = 0
+maximum_period = 150
+target_frame_nb = 255
+dataset_capture_mode = 2
+imu_collection_mode = 1
+image_capture_rate = 15
+imu_sample_rate_hz = 1
+target_processing_stage = 0
+active_cameras = [ true, true, true, true,]

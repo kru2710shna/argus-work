@@ -1,0 +1,43 @@
+[INIT]
+# INT
+collection_period = 60 # sec
+# img_collection_period = 60 # sec
+# imu_collection_period = 1  # sec
+# INT
+target_samples = 10 # samples 
+# INT
+max_collection_time = 3600 # sec
+# INT 
+max_downtime_for_restart_in_minutes = 120 # min : difference of time to allow between the current time and the last sample of a previous collection process to restart it
+
+[BATCH_OPT] # Nonlinear Batch-LSQ
+# INT or floating
+solver_function_tolerance = 1e-6
+# INT or floating
+solver_parameter_tolerance = 1e-10
+# INT or floating
+solver_gradient_check_relative_precision = 1e-6 # TODO: implement parsing
+# INT
+max_iterations = 10000 # iterations
+# INT or floating
+max_run_time_sec = 300.0 # seconds
+# INT
+bias_mode = 1 # 0: no gyro bias; 1: fixed/constant gyro bias; 2: time-varying bias
+# BOOL
+compute_covariance = true # set true to compute covariance.csv; expensive for large batches
+# BOOL
+use_j2 = true # include J2 zonal harmonic gravity perturbation in batch dynamics
+# BOOL
+use_drag = false # include atmospheric drag in batch dynamics (Vallado Table 8-4, 300-700 km)
+# FLOAT - drag coefficient nominal [-]
+cd_nominal = 2.2
+# FLOAT - Cd prior std dev [-]
+cd_std = 1.0
+# INT — integrator for orbital dynamics: 0 = forward-Euler, 1 = RK4
+integrator = 1
+# FLOAT — Pseudo-Huber transition point for landmark bearing cost [sigma units]
+landmark_huber_delta = 3.0
+# FLOAT — Mahalanobis distance threshold for landmark outlier rejection [sigma units]
+mahal_threshold = 5.0
+# INT — Maximum outlier-rejection loop iterations (excludes covariance solve)
+max_od_iterations = 10

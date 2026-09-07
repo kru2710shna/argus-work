@@ -1,0 +1,1075 @@
+#include "core/data_handling.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>  
+#include <fstream>
+#include <array>
+#include <optional>
+#include <sys/stat.h>
+#include <nlohmann/json.hpp>
+using Json = nlohmann::json;
+
+
+namespace DH // Data Handling
+{
+
+bool INIT_DATA_FOLDER_TREE = false;
+
+bool MakeNewDirectory(std::string_view directory_path)
+{
+    bool success = false;
+    if (fs::exists(directory_path)) 
+    {
+        SPDLOG_DEBUG("Folder {} already exists.", directory_path);
+        success = true;
+    } 
+    else if (fs::create_directory(directory_path)) 
+    {
+        SPDLOG_INFO("Folder created: {}.", directory_path);
+        success = true;
+    } else 
+    {
+        SPDLOG_CRITICAL("Failed to create folder: {}.", directory_path);
+    }
+
+    return success;
+
+}
+
+
+long GetFileSize(std::string_view file_path) // should maybe return a pair result / error
+{
+    struct stat stat_buf;
+    int rc = stat(std::string(file_path).c_str(), &stat_buf);
+
+    if (rc == -1) 
+    {
+        SPDLOG_ERROR("Failed to get file size for {}: {}", file_path, strerror(errno));
+        LogError(EC::FILE_DOES_NOT_EXIST);
+        return -1LL;
+    }
+
+    return stat_buf.st_size;
+}
+
+
+long GetDirectorySize(std::string_view directory_path) 
+{
+    long total_size = 0;
+    struct stat stat_buf;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(directory_path)) {
+        if (entry.is_regular_file()) 
+        {  
+            if (stat(entry.path().c_str(), &stat_buf) == 0) {
+                total_size += stat_buf.st_size;
+            }
+        }
+    }
+    return total_size;
+}
+
+int CountFilesInDirectory(std::string_view directory_path) 
+{
+    int file_count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory_path)) 
+    {
+        if (entry.is_regular_file()) {
+            ++file_count;
+        }
+    }
+    return file_count;
+}
+
+std::string getExtension(const std::string& path)
+{
+    size_t dot = path.find_last_of('.');
+    size_t slash = path.find_last_of("/\\");
+
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+        return "";  // no extension
+
+    return path.substr(dot);  // includes '.'
+}
+
+
+bool InitializeDataStorage()
+{
+    if (INIT_DATA_FOLDER_TREE) {
+        SPDLOG_INFO("Data folder tree already initialized.");
+        return true;
+    }
+
+    // Construct the full paths using the root and subdirectory names
+    std::vector<std::string> directories = {
+        ROOT_DATA_FOLDER,
+        IMAGES_FOLDER,
+        TELEMETRY_FOLDER,
+        DATASETS_FOLDER,
+        RESULTS_FOLDER,
+        LOGGING_FOLDER,
+        COMMS_FOLDER
+    };
+
+    bool success = true;
+    for (const auto& dir : directories) 
+    {
+        if (!MakeNewDirectory(dir)) {
+            SPDLOG_CRITICAL("Failed to create directory: {}", dir);
+            success = false;
+        }
+    }
+
+    INIT_DATA_FOLDER_TREE = success;
+
+    if (success) 
+    {
+        SPDLOG_INFO("Data folder tree initialized successfully.");
+    }
+
+    return success;
+    // TODO retry if failure
+}
+
+std::string StoreDatasetToDisk(Dataset& dataset) 
+{
+    std::ostringstream oss;
+    oss << DATASETS_FOLDER << dataset.GetCaptureStartTime() << "/dataset.json";
+    std::string dataset_file_path = oss.str();
+    Json j = dataset.toJson();
+
+    std::ofstream ofs(dataset_file_path, std::ios::out | std::ios::trunc);
+    if (!ofs.is_open())
+    {
+        SPDLOG_ERROR("Failed to write dataset to disk: {}", dataset_file_path);
+        return "";
+    }
+
+    ofs << j.dump(1,'\t');
+    ofs.close();
+    SPDLOG_INFO("Saved dataset to disk: {}", dataset_file_path);
+    SPDLOG_DEBUG("Dataset file size: {} bytes", GetFileSize(dataset_file_path));
+
+    return dataset_file_path;
+}
+
+// Write a processing.json file with all dataset and frame metadata for downloading.
+// Contains all frames in the dataset (not just those processed in this run).
+std::string StoreProcessingMetadataToDisk(Dataset& dataset) {
+    std::string processing_file_path = dataset.GetFolderPath() + "processing.json";
+
+    Json j = dataset.toJson();
+    j.erase("frame_id_list"); // remove the frame IDs for the processing file
+
+    // Add a list of the frame jsonfiles that were reprocessed in this run
+    std::vector<Json> processed_frames;
+    for (const auto& frame_id : dataset.GetStoredFrameIDs())
+    {
+        uint8_t cam_id;
+        uint64_t timestamp;
+        std::tie(cam_id, timestamp) = frame_id;
+
+        Json frame_metadata = LoadFrameMetadataFromDisk(timestamp, static_cast<int>(cam_id), dataset.GetFolderPath());
+        if (frame_metadata.is_null())
+        {
+            SPDLOG_ERROR("Failed to load metadata for frame ({}, {})", cam_id, timestamp);
+            continue;
+        }
+        processed_frames.push_back(frame_metadata);
+    }
+    j["processed_frames"] = processed_frames;
+
+    std::ofstream ofs(processing_file_path, std::ios::out | std::ios::trunc);
+    if (!ofs.is_open())
+    {
+        SPDLOG_ERROR("Failed to write processing metadata to disk: {}", processing_file_path);
+        return "";
+    }
+
+    ofs << j.dump(1,'\t');
+    ofs.close();
+    SPDLOG_INFO("Saved processing metadata to disk: {}", processing_file_path);
+    SPDLOG_DEBUG("Processing metadata file size: {} bytes", GetFileSize(processing_file_path));
+
+    return processing_file_path;
+
+}
+
+bool readDatasetFromDisk(const std::string& dataset_file_path, Dataset& dataset_out)
+{
+    if (!fs::exists(dataset_file_path)) 
+    {
+        SPDLOG_ERROR("Dataset file does not exist: {}", dataset_file_path);
+        return false;
+    }
+    Json j;
+    try
+    {
+        std::ifstream ifs(dataset_file_path);
+        ifs >> j;
+        ifs.close();
+        bool success = dataset_out.fromJson(j);
+        if (!success)
+        {
+            SPDLOG_ERROR("Failed to parse dataset from JSON: {}", dataset_file_path);
+            return false;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        SPDLOG_ERROR("Failed to read dataset from disk {}: {}", dataset_file_path, e.what());
+        return false;
+    }
+    return true;
+}
+
+std::string StoreFrameToDisk(Frame& frame, std::string_view target_folder,
+                              ImageFormat fmt, int jpg_quality)
+{
+    std::filesystem::path folder_path(target_folder);
+    if (!std::filesystem::is_directory(folder_path))
+    {
+        SPDLOG_ERROR("StoreFrameToDisk: target folder does not exist: {}", target_folder);
+        return "";
+    }
+    // Append separator so sub-path joins work uniformly
+    std::string folder = folder_path.string();
+    if (folder.back() != '/')
+        folder += '/';
+
+    std::string img_path = StoreRawImgToDisk(frame.GetTimestamp(), frame.GetCamID(),
+                                              frame.GetImg(), folder, fmt, jpg_quality);
+    if (img_path.empty())
+        return "";
+
+    StoreFrameMetadataToDisk(frame, folder);
+    return img_path;
+}
+
+void StoreFrameMetadataToDisk(Frame& frame, std::string_view target_folder)
+{
+    std::filesystem::path folder_path(target_folder);
+    if (!std::filesystem::is_directory(folder_path))
+    {
+        SPDLOG_ERROR("StoreFrameMetadataToDisk: target folder does not exist: {}", target_folder);
+        return;
+    }
+    std::string folder = folder_path.string();
+    if (folder.back() != '/')
+        folder += '/';
+
+    std::ostringstream oss;
+    oss << folder << "frame" << DELIMITER << frame.GetTimestamp() << DELIMITER << frame.GetCamID() << ".json";
+    std::string file_path = oss.str();
+
+    nlohmann::ordered_json j = frame.toOrderedJson();
+
+    // Inject raw_image block: probe for the stored image file (PNG or JPG)
+    for (ImageFormat fmt : {ImageFormat::JPG, ImageFormat::PNG})
+    {
+        std::ostringstream img_oss;
+        img_oss << folder << "raw" << DELIMITER
+                << frame.GetTimestamp() << DELIMITER
+                << frame.GetCamID() << ImageFormatExtension(fmt);
+        std::string raw_path = img_oss.str();
+
+        if (std::filesystem::exists(raw_path))
+        {
+            const cv::Size img_size = frame.GetImgSize();
+            nlohmann::ordered_json raw_image_j;
+            raw_image_j["path"]       = raw_path;
+            raw_image_j["format"]     = ImageFormatToString(fmt);
+            raw_image_j["width"]      = img_size.width;
+            raw_image_j["height"]     = img_size.height;
+            raw_image_j["size_bytes"] = GetFileSize(raw_path);
+            j["raw_image"] = raw_image_j;
+            break;
+        }
+    }
+
+    std::ofstream ofs(file_path, std::ios::out | std::ios::trunc);
+    if (!ofs.is_open())
+    {
+        SPDLOG_ERROR("Failed to write metadata to disk: {}", file_path);
+        return;
+    }
+
+    ofs << j.dump(1,'\t');
+    ofs.close();
+    SPDLOG_INFO("Saved metadata to disk: {}", file_path);
+    SPDLOG_DEBUG("Metadata file size: {} bytes", GetFileSize(file_path));
+}
+
+std::string StoreRawImgToDisk(std::uint64_t timestamp, int cam_id, const cv::Mat& img,
+                               std::string_view target_folder,
+                               ImageFormat fmt, int jpg_quality)
+{
+    std::filesystem::path folder_path(target_folder);
+    if (!std::filesystem::is_directory(folder_path))
+    {
+        SPDLOG_ERROR("StoreRawImgToDisk: target folder does not exist: {}", target_folder);
+        return "";
+    }
+    std::string folder = folder_path.string();
+    if (folder.back() != '/')
+        folder += '/';
+
+    std::ostringstream oss;
+    oss << folder << "raw" << DELIMITER << timestamp << DELIMITER << cam_id
+        << ImageFormatExtension(fmt);
+    std::string file_path = oss.str();
+
+    std::vector<int> params;
+    if (fmt == ImageFormat::JPG)
+        params = {cv::IMWRITE_JPEG_QUALITY, jpg_quality};
+
+    if (!cv::imwrite(file_path, img, params))
+    {
+        SPDLOG_ERROR("Failed to write image to disk: {}", file_path);
+        return "";
+    }
+
+    SPDLOG_INFO("Saved img to disk: {} ({})", file_path, ImageFormatToString(fmt));
+    SPDLOG_INFO("File size: {} bytes", GetFileSize(file_path));
+    SPDLOG_DEBUG("Total size of folder {}: {} bytes", folder, GetDirectorySize(folder));
+    SPDLOG_DEBUG("Number of files in folder {}: {}", folder, CountFilesInDirectory(folder));
+
+    return file_path; // return value optimized 
+}
+
+namespace
+{
+std::string NormalizeFolder(std::string_view folder)
+{
+    std::filesystem::path folder_path(folder);
+    std::string normalized = folder_path.string();
+    if (!normalized.empty() && normalized.back() != '/')
+        normalized += '/';
+    return normalized;
+}
+
+bool IsRawImageFile(const fs::path& path)
+{
+    if (!path.has_filename())
+        return false;
+
+    const std::string filename = path.filename().string();
+    if (filename.rfind("raw" DELIMITER, 0) != 0)
+        return false;
+
+    const std::string ext = path.extension().string();
+    return ext == ImageFormatExtension(ImageFormat::JPG)
+        || ext == ImageFormatExtension(ImageFormat::PNG);
+}
+
+std::optional<fs::path> FindRawImagePath(std::uint64_t timestamp, int cam_id, std::string_view folder)
+{
+    const std::string normalized_folder = NormalizeFolder(folder);
+    for (ImageFormat fmt : {ImageFormat::JPG, ImageFormat::PNG})
+    {
+        fs::path candidate = normalized_folder + "raw" + DELIMITER
+                           + std::to_string(timestamp) + DELIMITER
+                           + std::to_string(cam_id) + ImageFormatExtension(fmt);
+        if (fs::exists(candidate))
+            return candidate;
+    }
+
+    return std::nullopt;
+}
+
+std::optional<fs::path> ResolveRawImagePath(const Json& j, const Frame& frame, std::string_view folder)
+{
+    if (auto raw_image_it = j.find("raw_image"); raw_image_it != j.end() && raw_image_it->is_object())
+    {
+        if (auto path_it = raw_image_it->find("path"); path_it != raw_image_it->end() && path_it->is_string())
+        {
+            fs::path raw_path = path_it->get<std::string>();
+            if (fs::exists(raw_path))
+                return raw_path;
+        }
+    }
+
+    return FindRawImagePath(frame.GetTimestamp(), frame.GetCamID(), folder);
+}
+
+bool GetLatestRawFilePathInFolder(std::filesystem::directory_entry& latest_file, std::string_view folder)
+{
+    const fs::path folder_path(folder);
+    if (!fs::exists(folder_path))
+        return false;
+
+    bool found = false;
+    for (const auto& entry : fs::directory_iterator(folder_path))
+    {
+        if (!entry.is_regular_file() || !IsRawImageFile(entry.path()))
+            continue;
+
+        if (!found || entry.last_write_time() > latest_file.last_write_time())
+        {
+            latest_file = entry;
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+bool GetLatestRegularFilePathInFolder(std::filesystem::directory_entry& latest_file, std::string_view folder)
+{
+    const fs::path folder_path(folder);
+    if (!fs::exists(folder_path))
+        return false;
+
+    bool found = false;
+    for (const auto& entry : fs::directory_iterator(folder_path))
+    {
+        if (!entry.is_regular_file())
+            continue;
+
+        if (!found || entry.last_write_time() > latest_file.last_write_time())
+        {
+            latest_file = entry;
+            found = true;
+        }
+    }
+
+    return found;
+}
+}
+
+
+// Returns true if the latest file is found, false otherwise
+bool GetLatestRawFilePath(std::filesystem::directory_entry& latest_file)
+{
+    const bool found = GetLatestRawFilePathInFolder(latest_file, IMAGES_FOLDER);
+    if (found)
+        SPDLOG_INFO("Latest raw image file: {}", latest_file.path().string());
+    return found;
+}
+
+// Returns true if the highest value file is found, false otherwise
+// Reads JSON file metadata to determine the highest value image
+bool GetHighestValueRawFilePath(std::filesystem::directory_entry& highest_value_file)
+{
+
+    Frame best_frame;
+    bool found = false;
+    
+    for (const auto& entry : std::filesystem::directory_iterator(IMAGES_FOLDER)) 
+    {
+        if (entry.is_regular_file()) 
+        {
+            
+            if (entry.path().extension() == ".json")
+            {
+
+                Json j;
+
+                try // make sure the json loads correctly
+                {
+                    std::ifstream ifs(entry.path());
+                    ifs >> j;
+                    ifs.close();
+                }
+                
+                catch (const std::exception& e)
+                {
+                    SPDLOG_ERROR("Failed to read JSON file {}: {}", entry.path().string(), e.what());
+                    continue;
+                }
+
+                Frame cur_frame;
+                cur_frame.fromJson(j);
+
+                if (!found || cur_frame > best_frame)
+                {
+                    auto raw_path = ResolveRawImagePath(j, cur_frame, IMAGES_FOLDER);
+                    if (!raw_path)
+                    {
+                        SPDLOG_WARN("No raw image found for metadata file {}", entry.path().string());
+                        continue;
+                    }
+
+                    best_frame = cur_frame;
+                    highest_value_file = std::filesystem::directory_entry(*raw_path);
+                    found = true;
+                }
+            }
+        }
+    }
+
+
+    SPDLOG_INFO("Highest Value file: {}", highest_value_file.path().string());
+    return found;
+}
+
+
+// We know the structure of the filename already (raw_timestamp_camid.png)
+void SplitRawImgPath(const std::string& input, std::uint64_t& timestamp, int& cam_id) 
+{
+
+    size_t start = 4; // after "raw" + delimiter
+    size_t end = 0;
+
+    // Extract the timestamp and camera ID
+    end = input.find(DELIMITER, start);
+    SPDLOG_DEBUG("Start: {}, End: {}", start, end);
+    SPDLOG_DEBUG("Timestamp substring: {}", input.substr(start, end - start));
+    timestamp = std::stoull(input.substr(start, end - start));
+    //timestamp = std::strtoull(input.substr(start, end - start).c_str(), nullptr, 10);
+    //timestamp = static_cast<uint64_t>(atoll(input.substr(start, end - start).c_str()));
+
+    
+    start = end + 1;
+    
+    // Add the last part (before .png)
+    end = input.rfind('.');
+    cam_id = std::stoi(input.substr(start, end - start));
+}
+
+
+
+bool ReadLatestStoredRawImg(Frame& frame)
+{
+
+    std::filesystem::directory_entry latest_file;
+
+    if (!GetLatestRawFilePath(latest_file)) 
+    {
+        SPDLOG_WARN("No files found in the directory.");
+        return false;
+    }
+
+    std::string latest_file_path = latest_file.path().string();
+    std::string infolder_latest_file_path = latest_file_path.substr(latest_file_path.find_last_of("/\\") + 1);
+
+    // Extract timestamp and id from filename
+    std::uint64_t extracted_timestamp;
+    int extracted_cam_id;
+    SplitRawImgPath(infolder_latest_file_path, extracted_timestamp, extracted_cam_id);
+    SPDLOG_DEBUG("Timestamp: {}, Camera ID: {}", extracted_timestamp, extracted_cam_id);
+
+
+    // Load the image into memory
+    // CV_8UC3 - 8-bit unsigned integer matrix/image with 3 channels
+    cv::Mat extracted_img = cv::imread(latest_file_path, cv::IMREAD_COLOR); // Load the image from the file
+    if (extracted_img.empty()) 
+    {
+        SPDLOG_ERROR("Failed to load image from disk.");
+        return false;
+    }
+
+
+    frame.Update(extracted_cam_id, extracted_img, extracted_timestamp);
+
+    SPDLOG_INFO("Image loaded successfully.");
+    return true;
+
+}
+
+bool ReadHighestValueStoredRawImg(Frame& frame)
+{
+
+    std::filesystem::directory_entry highest_value_file;
+
+    if (!GetHighestValueRawFilePath(highest_value_file)) 
+    {
+        SPDLOG_WARN("No files found in the directory.");
+        return false;
+    }
+
+    std::string highest_value_file_path = highest_value_file.path().string();
+    SPDLOG_INFO("Highest value image path: {}", highest_value_file_path);
+
+    std::string infolder_highest_value_file_path = highest_value_file_path.substr(highest_value_file_path.find_last_of("/\\") + 1);
+
+    // Extract timestamp and id from filename
+    std::uint64_t extracted_timestamp;
+    int extracted_cam_id;
+    SplitRawImgPath(infolder_highest_value_file_path, extracted_timestamp, extracted_cam_id);
+    SPDLOG_DEBUG("Filename: {}, Timestamp: {}, Camera ID: {}", infolder_highest_value_file_path, extracted_timestamp, extracted_cam_id);
+
+
+    // Load the image into memory
+    // CV_8UC3 - 8-bit unsigned integer matrix/image with 3 channels
+    cv::Mat extracted_img = cv::imread(highest_value_file_path, cv::IMREAD_COLOR); // Load the image from the file
+    if (extracted_img.empty()) 
+    {
+        SPDLOG_ERROR("Failed to load image from disk.");
+        return false;
+    }
+
+
+    frame.Update(extracted_cam_id, extracted_img, extracted_timestamp);
+
+    SPDLOG_INFO("Image loaded successfully.");
+    return true;
+}
+
+
+// New function to get the latest binary image file path (img_<timestamp>_<camera_id>.bin)
+// Only looks in the COMMS_FOLDER
+std::string GetLatestImgBinPath()
+{
+    std::filesystem::directory_entry latest_file;
+    bool found = false;
+    
+    // Look for img_*_*.bin files in COMMS_FOLDER only
+    if (!std::filesystem::exists(COMMS_FOLDER))
+    {
+        SPDLOG_WARN("COMMS_FOLDER does not exist: {}", COMMS_FOLDER);
+        return "";
+    }
+    
+    for (const auto& entry : std::filesystem::directory_iterator(COMMS_FOLDER)) 
+    {
+        if (entry.is_regular_file()) 
+        {
+            std::string filename = entry.path().filename().string();
+            
+            // Check if it matches img_*_*.bin pattern (img_<timestamp>_<camera_id>.bin)
+            if (filename.rfind("img_", 0) == 0 && filename.substr(filename.length() - 4) == ".bin")
+            {
+                if (!found || entry.last_write_time() > latest_file.last_write_time()) 
+                {
+                    latest_file = entry;
+                    found = true;
+                }
+            }
+        }
+    }
+
+    if (!found)
+    {
+        SPDLOG_WARN("No binary image files (img_*_*.bin) found in {}", COMMS_FOLDER);
+        return "";
+    }
+
+    std::string file_path = latest_file.path().string();
+    SPDLOG_INFO("Latest binary image file in comms: {}", file_path);
+    return file_path;
+
+}
+
+// TODO: investigate the overloaded functions, ensure safety
+
+bool ReadImageFromDisk(const std::string& file_path, Frame& frame_out, int cam_id, std::uint64_t timestamp)
+{
+    // Load the image into memory
+    cv::Mat img = cv::imread(file_path, cv::IMREAD_COLOR); // Load the image from the file
+    if (img.empty()) 
+    {
+        SPDLOG_ERROR("Failed to load image from disk: {}", file_path);
+        LogError(EC::FILE_NOT_FOUND);
+        return false;
+    }
+
+    // TODO: optional metadata extraction
+    frame_out.Update(cam_id, img, timestamp);
+
+    SPDLOG_INFO("Image loaded successfully from disk: {}", file_path);
+    return true;
+}
+
+bool ReadImageFromDisk(std::uint64_t timestamp, int cam_id, Frame& frame_out, std::string_view target_folder)
+{
+    std::filesystem::path folder_path(target_folder);
+    if (!std::filesystem::is_directory(folder_path))
+    {
+        SPDLOG_ERROR("ReadImageFromDisk: target folder does not exist: {}", target_folder);
+        return false;
+    }
+    std::string folder = folder_path.string();
+    if (folder.back() != '/')
+        folder += '/';
+
+    // Try both formats
+    for (ImageFormat fmt : {ImageFormat::JPG, ImageFormat::PNG})
+    {
+        std::ostringstream oss;
+        oss << folder << "raw" << DELIMITER << timestamp << DELIMITER << cam_id
+            << ImageFormatExtension(fmt);
+        if (std::filesystem::exists(oss.str()))
+            return ReadImageFromDisk(oss.str(), frame_out, cam_id, timestamp);
+    }
+    SPDLOG_ERROR("ReadImageFromDisk: no raw image found for timestamp={} cam_id={} in {}",
+                 timestamp, cam_id, target_folder);
+    return false;
+}
+
+Json LoadFrameMetadataFromDisk(std::uint64_t timestamp, int cam_id, std::string_view target_folder)
+{
+    std::filesystem::path folder_path(target_folder);
+    if (!std::filesystem::is_directory(folder_path))
+    {
+        SPDLOG_ERROR("ReadImageFromDisk: target folder does not exist: {}", target_folder);
+        return Json(); // Return empty JSON on failure
+    }
+    std::string folder = folder_path.string();
+    if (folder.back() != '/')
+        folder += '/';
+    
+    std::ostringstream oss;
+    oss << folder << "frame" << DELIMITER << timestamp << DELIMITER << cam_id << ".json";
+    std::string file_path = oss.str();
+
+    std::ifstream ifs(file_path);
+    if (!ifs.is_open())
+    {
+        SPDLOG_ERROR("Failed to load frame metadata from disk: {}", file_path);
+        return Json(); // Return empty JSON on failure
+    }
+
+    Json j;
+    try
+    {
+        ifs >> j;
+    }
+    catch (const std::exception& e)
+    {
+        SPDLOG_ERROR("Failed to parse JSON metadata from file {}: {}", file_path, e.what());
+        return Json(); // Return empty JSON on failure
+    }
+
+    SPDLOG_INFO("Frame metadata loaded successfully from disk: {}", file_path);
+    return j;
+}
+
+EC ReadFileChunk(std::string_view file_path, uint32_t start_byte, uint32_t length, std::vector<uint8_t>& data_out)
+{
+    data_out.resize(length, 0); 
+
+    std::ifstream file(file_path.data(), std::ios::binary);
+    if (!file.is_open()) 
+    {
+        LogError(EC::FILE_NOT_FOUND);
+        return EC::FILE_NOT_FOUND;
+    }
+        
+    // TODO: could add a check if start byte is > file size
+    if (start_byte >= GetFileSize(file_path)) 
+    {
+        SPDLOG_ERROR("Start byte {} is out of range for file {}", start_byte, file_path);
+        LogError(EC::START_BYTE_OUT_OF_RANGE);
+        return EC::START_BYTE_OUT_OF_RANGE;
+    }
+
+    file.seekg(start_byte, std::ios::beg);
+    file.read(reinterpret_cast<char*>(data_out.data()), length);
+    data_out.resize(static_cast<uint32_t>(file.gcount())); // trim to actual bytes read
+
+    return EC::OK;
+}
+
+int CountRawImgNumberOnDisk()
+{
+    return CountFilesInDirectory(IMAGES_FOLDER);
+}
+
+
+int GetTotalDiskUsage() 
+{
+    // "df -h | grep '/dev/nvme' | awk '{print $5}' | head -n 1"
+
+    std::error_code ec; // capture errors instead of throwing exceptions
+    std::filesystem::space_info info = std::filesystem::space(ROOT_DISK, ec);
+
+    if (ec)
+    {
+        SPDLOG_ERROR("Error accessing disk space for path '{}': {}", ROOT_DISK, ec.message());
+        return -1; // Return -1 to indicate an error
+    }
+
+    double usage_percentage = (1.0 - static_cast<double>(info.free) / info.capacity) * 100.0;
+    return static_cast<int>(std::round(usage_percentage)); // round to nearest integer
+
+}
+
+bool WriteFixedPacketFile(const std::string& output_path, const std::vector<std::vector<uint8_t>>& payloads)
+{
+    static const std::array<uint8_t, DH_FILE_HEADER_SIZE> MAGIC = {'D', 'H', 'G', 'E', 'N'};
+
+    std::ofstream file(output_path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) 
+    {
+        SPDLOG_ERROR("Failed to open output file: {}", output_path);
+        LogError(EC::FILE_NOT_FOUND);
+        return false;
+    }
+
+    file.write(reinterpret_cast<const char*>(MAGIC.data()), MAGIC.size());
+
+    std::array<uint8_t, DH_FIXED_PACKET_SIZE> packet_buf{};
+    std::size_t idx = 0;
+    for (const auto& payload : payloads)
+    {
+        if (payload.size() > DH_MAX_PAYLOAD_SIZE)
+        {
+            SPDLOG_ERROR("Payload {} too large for data handler format: {} bytes > {}", idx, payload.size(), DH_MAX_PAYLOAD_SIZE);
+            return false;
+        }
+
+        packet_buf.fill(0);
+        const uint16_t payload_len = static_cast<uint16_t>(payload.size());
+        packet_buf[0] = static_cast<uint8_t>((payload_len >> 8) & 0xFF);
+        packet_buf[1] = static_cast<uint8_t>(payload_len & 0xFF);
+        std::copy(payload.begin(), payload.end(), packet_buf.begin() + DH_PACKET_HEADER_SIZE);
+
+        file.write(reinterpret_cast<const char*>(packet_buf.data()), packet_buf.size());
+        ++idx;
+    }
+
+    file.flush();
+    return true;
+}
+
+bool ReadFixedPacketFile(const std::string& input_path, std::vector<std::vector<uint8_t>>& payloads_out)
+{
+    static const std::array<uint8_t, DH_FILE_HEADER_SIZE> MAGIC = {'D', 'H', 'G', 'E', 'N'};
+
+    payloads_out.clear();
+
+    std::ifstream file(input_path, std::ios::binary);
+    if (!file.is_open()) 
+    {
+        SPDLOG_ERROR("Failed to open input file: {}", input_path);
+        LogError(EC::FILE_NOT_FOUND);
+        return false;
+    }
+
+    std::array<char, DH_FILE_HEADER_SIZE> header{};
+    file.read(header.data(), header.size());
+    const bool is_magic = (file.gcount() == static_cast<std::streamsize>(header.size()) &&
+                           std::equal(header.begin(), header.end(), MAGIC.begin()));
+
+    if (!is_magic)
+    {
+        // Treat as raw file split into DH_MAX_PAYLOAD_SIZE chunks
+        file.clear();
+        file.seekg(0, std::ios::beg);
+        while (true)
+        {
+            std::vector<uint8_t> chunk(DH_MAX_PAYLOAD_SIZE, 0);
+            file.read(reinterpret_cast<char*>(chunk.data()), DH_MAX_PAYLOAD_SIZE);
+            const std::streamsize read_bytes = file.gcount();
+            if (read_bytes <= 0) break;
+
+            chunk.resize(static_cast<std::size_t>(read_bytes));
+            payloads_out.push_back(std::move(chunk));
+        }
+        return true;
+    }
+
+    std::size_t idx = 0;
+    while (true)
+    {
+        std::array<uint8_t, DH_FIXED_PACKET_SIZE> packet_buf{};
+        file.read(reinterpret_cast<char*>(packet_buf.data()), packet_buf.size());
+        const std::streamsize read_bytes = file.gcount();
+        if (read_bytes == 0) break; // EOF
+
+        if (read_bytes < DH_PACKET_HEADER_SIZE)
+        {
+            SPDLOG_ERROR("Truncated packet header at index {} in {}", idx, input_path);
+            return false;
+        }
+
+        const uint16_t payload_len = static_cast<uint16_t>(packet_buf[0]) << 8 | packet_buf[1];
+        if (payload_len == 0 || payload_len > DH_MAX_PAYLOAD_SIZE)
+        {
+            SPDLOG_ERROR("Invalid payload length {} at index {} in {}", payload_len, idx, input_path);
+            return false;
+        }
+
+        if (payload_len > static_cast<uint16_t>(std::max<std::streamsize>(0, read_bytes - DH_PACKET_HEADER_SIZE)))
+        {
+            SPDLOG_ERROR("Payload length {} exceeds bytes read {} at index {} in {}", payload_len, read_bytes, idx, input_path);
+            return false;
+        }
+
+        payloads_out.emplace_back(packet_buf.begin() + DH_PACKET_HEADER_SIZE,
+                                  packet_buf.begin() + DH_PACKET_HEADER_SIZE + payload_len);
+
+        if (read_bytes < static_cast<std::streamsize>(DH_FIXED_PACKET_SIZE))
+        {
+            SPDLOG_WARN("Partial packet read at index {} ({} bytes) in {}", idx, read_bytes, input_path);
+            break;
+        }
+
+        ++idx;
+    }
+
+    return true;
+}
+
+void EmptyCommsFolder()
+{
+    for (const auto& entry : std::filesystem::directory_iterator(COMMS_FOLDER)) 
+    {
+        std::filesystem::remove_all(entry.path());
+    }
+}
+
+std::string CopyFrameToCommsFolder(Frame& frame)
+{
+    if (CountFilesInDirectory(COMMS_FOLDER) > 0)
+    {
+       SPDLOG_WARN("Overwriting file in comms folder.");
+        EmptyCommsFolder();
+    }
+    // Store the image in the comms folder
+    return StoreRawImgToDisk(frame.GetTimestamp(), frame.GetCamID(), frame.GetImg(), COMMS_FOLDER);
+}
+
+EC GetCommsFilePath(std::string& path_out) 
+{
+    std::filesystem::directory_entry latest_file;
+    if (!GetLatestRegularFilePathInFolder(latest_file, COMMS_FOLDER)) {
+        SPDLOG_WARN("No files found in the comms folder.");
+        LogError(EC::FILE_NOT_FOUND);
+        return EC::FILE_NOT_FOUND;
+    }
+
+    path_out = latest_file.path().string();
+
+    return EC::OK;
+}
+
+/* 
+ * PacketizeJsonFile()
+ * 
+ * Function to convert a .JSON (text) file to packets
+ * 
+ * Inputs:
+ *  - json_path : string containing JSON file path
+ *  - output_path : string containing file path to send packets to
+ * 
+ * Outputs:
+ *  - true if conversion and send successful, else false
+ */
+bool PacketizeJsonFile(const std::string& json_path, const std::string& output_path)
+{
+    // Open the JSON file in binary mode to get the raw UTF-8 bytes
+    // exactly as they exist on disk, without any newline translation
+    std::ifstream file(json_path, std::ios::binary);
+    if (!file.is_open())
+    {
+        SPDLOG_ERROR("Failed to open JSON file for packetization: {}", json_path);
+        LogError(EC::FILE_NOT_FOUND);
+        return false;
+    }
+
+    std::vector<uint8_t> raw_bytes(
+        (std::istreambuf_iterator<char>(file)),
+         std::istreambuf_iterator<char>()
+    );
+    file.close();
+
+    if (raw_bytes.empty())
+    {
+        SPDLOG_WARN("JSON file is empty, nothing to packetize: {}", json_path);
+        return false;
+    }
+
+    // Strip UTF-8 BOM (0xEF 0xBB 0xBF) if present — some Windows editors
+    // prepend this and strict JSON parsers will reject it on reassembly
+    if (raw_bytes.size() >= 3 &&
+        raw_bytes[0] == 0xEF &&
+        raw_bytes[1] == 0xBB &&
+        raw_bytes[2] == 0xBF)
+    {
+        SPDLOG_WARN("UTF-8 BOM detected in {}, stripping before packetization", json_path);
+        raw_bytes.erase(raw_bytes.begin(), raw_bytes.begin() + 3);
+    }
+
+    // Split the raw bytes into DH_MAX_PAYLOAD_SIZE chunks
+    std::vector<std::vector<uint8_t>> payloads;
+    size_t offset = 0;
+    while (offset < raw_bytes.size())
+    {
+        size_t chunk_size = std::min(static_cast<size_t>(DH_MAX_PAYLOAD_SIZE),
+                                     raw_bytes.size() - offset);
+        payloads.emplace_back(raw_bytes.begin() + offset,
+                              raw_bytes.begin() + offset + chunk_size);
+        offset += chunk_size;
+    }
+
+    SPDLOG_INFO("Packetizing JSON file '{}' into {} packet(s) -> '{}'",
+                json_path, payloads.size(), output_path);
+
+    if (!WriteFixedPacketFile(output_path, payloads))
+    {
+        SPDLOG_ERROR("Failed to write packetized JSON to: {}", output_path);
+        return false;
+    }
+
+    SPDLOG_INFO("JSON packetization complete. Output size: {} bytes", GetFileSize(output_path));
+
+    return true;
+
+    // TODO: do we need checksums to make sure data is correct?
+}
+
+/* 
+ * DepacketizeJsonFile()
+ * 
+ * Function to convert byte packets back into full .JSON (text) file
+ * 
+ * Inputs:
+ *  - input_path : file path to the packets to be reassembled
+ *  - json_output_path : file path for reconstructed file
+ * 
+ * Outputs:
+ *  - true if reassembly successful, else false
+ */
+bool DepacketizeJsonFile(const std::string& input_path, const std::string& json_output_path)
+{
+    // Read the fixed-packet file back into payload chunks
+    std::vector<std::vector<uint8_t>> payloads;
+    if (!ReadFixedPacketFile(input_path, payloads))
+    {
+        SPDLOG_ERROR("Failed to read packetized file for JSON reassembly: {}", input_path);
+        return false;
+    }
+
+    if (payloads.empty())
+    {
+        SPDLOG_WARN("No payloads found in file: {}", input_path);
+        return false;
+    }
+
+    // Reassemble all payload chunks back into a contiguous byte buffer
+    std::vector<uint8_t> raw_bytes;
+    for (const auto& chunk : payloads)
+        raw_bytes.insert(raw_bytes.end(), chunk.begin(), chunk.end());
+
+    // Validate that the result is plausible UTF-8 JSON before writing
+    // (quick sanity check — looks for opening brace or bracket)
+    if (!raw_bytes.empty() && raw_bytes.front() != '{' && raw_bytes.front() != '[')
+    {
+        SPDLOG_WARN("Reassembled data does not appear to start with a JSON object or array. "
+                    "First byte: 0x{:02X}", raw_bytes.front());
+    }
+
+    // Write the reassembled bytes back out as a .json file
+    std::ofstream out(json_output_path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open())
+    {
+        SPDLOG_ERROR("Failed to open output JSON file for writing: {}", json_output_path);
+        LogError(EC::FILE_NOT_FOUND);
+        return false;
+    }
+
+    out.write(reinterpret_cast<const char*>(raw_bytes.data()), raw_bytes.size());
+    out.close();
+
+    SPDLOG_INFO("JSON reassembly complete: {} packets -> '{}' ({} bytes)",
+                payloads.size(), json_output_path, raw_bytes.size());
+
+    SPDLOG_DEBUG("Output JSON file size: {} bytes", GetFileSize(json_output_path));
+
+    return true;
+
+    // TODO: do we need checksums to make sure data is correct?
+}
+
+} // namespace DH

@@ -1,0 +1,91 @@
+# Payload Flight Software for Argus
+
+This repository contains the Argus Payload Flight Software for the Jetson Orin Nano (8GB) and its custom carrier board. Argus is a technology demonstration mission focused on vision-based orbit determination.
+
+## Install instructions 
+
+- CUDA
+- TensorRT
+- [spdlog](https://github.com/gabime/spdlog) - Logging library
+- [OpenCV](https://docs.opencv.org/4.x/d7/d9f/tutorial_linux_install.html?ref=wasyresearch.com) - Computer vision library
+- [Eigen3](http://eigen.tuxfamily.org/index.php?title=Main_Page#Download) - Linear algebra Library
+- [GTest](https://github.com/google/googletest) - testing framework
+- TODO
+
+The `models` submodule now tracks the DVC-based workflow on its `dvc` branch. A normal submodule checkout gives you the Git metadata, but the large model artifacts still need to be fetched with `dvc pull`.
+
+Then install the project dependencies:
+
+```bash
+sudo chmod +x install_deps.sh build.sh run.sh 
+./install_deps.sh
+```
+
+The install script installs the system dependencies needed for the project, including `pipx` and `dvc[ssh]` for model artifact pulls.
+
+The build script now:
+
+- syncs and initializes the submodules
+- runs `dvc pull` inside `models` before compiling if `dvc` is available
+
+If you want to move `models` to the latest commit on its tracked `dvc` branch instead of the commit pinned by the parent repo, run:
+
+```bash
+git submodule update --init --recursive --remote models
+```
+
+If you ever need to refresh the model artifacts manually after updating the submodule, run:
+
+```bash
+cd models
+dvc pull
+cd ..
+```
+
+If `dvc` is installed but not found in a new shell, run `pipx ensurepath` and restart the terminal.
+
+#### OpenCV
+
+OpenCV needs to be installed with CUDA support. The OpenCV version that is natively installed on the jetson won't have cuda support. The installation guide to include cuda support is provided in https://qengineering.eu/install-opencv-on-jetson-nano.html. The shell script install_opencv4.9.0_Jetpack6.0.sh is taken from there, running it will take approximately 2 hours.
+
+## Build instructions
+
+Give permissions to both scripts 
+```bash
+sudo chmod +x build.sh run.sh 
+```
+
+### Setting up the Environment
+
+To compile using CMake, build the project using the helper script:
+
+```bash
+./build.sh [Debug|Release] [disable-nn]
+./bin/PAYLOAD [optional: <communication-interface: [UART, CLI]>]
+```
+
+All binaries will appear in the bin folder.
+
+## Configuration
+
+The configuration file is located at config/config.toml. Update this file to modify system parameters.
+
+## Local interaction with the FSW
+
+As a functional debugging tool, the Payload can be run and controlled locally through a command-line interface, either through the compiled one or the python interface (perfect replica). First, run the main process in CLI mode:
+
+```bash
+./bin/PAYLOAD [optional: <communication-interface: [UART, CLI]>] // default to UART 
+```
+In another terminal, launch either the compiled CLI or its python equivalent (perfect replica):
+```bash
+./bin/CLI_CMD
+or
+python python/cli_cmd.py
+```
+
+Under the hood, both processes communicates through 2 distinct named pipes (FIFO).
+
+## Command-based paradigm 
+
+The Payload communicates through its host machine via UART (transition from SPI in progress) with a set of predefined commands available at TODO (internal README).

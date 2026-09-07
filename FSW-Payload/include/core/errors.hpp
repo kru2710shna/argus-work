@@ -1,0 +1,117 @@
+#ifndef ERRORS_HPP
+#define ERRORS_HPP
+
+#include <deque>
+#include <cstdint>
+
+
+// Master list of all runtime error codes throughout the codebase 
+// system-wide error logging 
+// Circular buffer 
+
+
+// TODO: constexpr
+enum class ErrorCode // Error codes  
+{
+    // TODO must be extremely well documented 
+    OK = 0, // Can't be logged
+    PLACEHOLDER = 1,
+    
+    // Commands 2-7
+    INVALID_COMMAND_ID,
+    INVALID_COMMAND_ARGUMENTS,
+    NO_FILE_READY,
+    NO_MORE_PACKET_FOR_FILE, 
+    FAIL_TO_READ_FILE, 
+    FILE_NOT_AVAILABLE, // DO NOT CHANGE ALL ABOVE
+
+    // Data handling 8-11
+    FILE_DOES_NOT_EXIST,
+    FILE_NOT_FOUND,
+    START_BYTE_OUT_OF_RANGE,
+    FAILED_TO_GRAB_FILE_CHUNK, 
+    
+    // Camera subsystem 12-13
+    CAMERA_CAPTURE_FAILED,
+    CAMERA_INITIALIZATION_FAILED,
+
+
+    // Task execution and queue 
+    // Thread pool 
+
+
+
+    // Telemetry
+
+
+    // UART 14-23
+    UART_OPEN_FAILED,
+    UART_CLOSE_FAILED,
+    UART_OPEN_FAILED_AFTER_RETRY,
+    UART_CLOSE_FAILED_AFTER_RETRY,
+    UART_NOT_OPEN,
+    UART_GETATTR_FAILED,
+    UART_SETATTR_FAILED,
+    UART_FAILED_WRITE,
+    UART_WRITE_BUFFER_OVERFLOW,
+    UART_INCOMPLETE_READ,
+    
+
+
+
+    // Neural Engine 24-33 
+    NN_FAILED_TO_OPEN_ENGINE_FILE,
+    NN_FAILED_TO_CREATE_RUNTIME,
+    NN_FAILED_TO_CREATE_ENGINE,
+    NN_FAILED_TO_CREATE_EXECUTION_CONTEXT,
+    NN_FAILED_TO_LOAD_ENGINE,
+    NN_ENGINE_NOT_INITIALIZED, // Runtime not initialized
+    NN_CUDA_MEMCPY_FAILED,
+    NN_POINTER_NULL,
+    NN_INFERENCE_FAILED,
+    NN_NO_FRAME_AVAILABLE, // No frame available for inference
+    NN_INSUFFICIENT_GPU_MEMORY, // Not enough free GPU memory to safely proceed
+    NN_INVALID_VERSION,          // Version number is out of valid range (must be > 0)
+
+
+
+    // OD
+    ODMEAS_NOT_VALID,          // ODMeasurements::Validate() failed; see spdlog output for details
+    BATCH_OPT_BUILD_FAILED,    // could not construct a valid Ceres problem (bad gyro span, group mismatch)
+    BATCH_OPT_NO_CONVERGENCE,  // solver hit iteration/time limit without satisfying tolerances
+    BATCH_OPT_SOLVER_FAILED,   // Ceres returned FAILURE (numerical breakdown)
+    BATCH_OPT_INVALID_OUTPUT,  // state estimates contain NaN/inf or denormalized quaternions
+
+
+    UNDEFINED // Last error for checking (Sentinel value)
+};
+
+// Alias for readability
+using EC = ErrorCode;
+
+
+constexpr uint8_t to_uint8(ErrorCode ec) 
+{
+    return static_cast<uint8_t>(ec);
+}
+
+
+// Log any incoming error with their correspondign timestamp in the circular buffer 
+// Note that OK is never logged to the buffer
+void LogError(EC error_code);
+
+
+// Retrieve the latest generated error. Default to OK if empty.
+EC GetLastError();
+
+
+// Get the number of errors in the buffer. If the buffer is full, this size will remain constant indefinitely.
+std::size_t GetCurrentErrorCount();
+
+// Simple getter to retrieve the nmx size of the buffer
+std::size_t GetMaxErrorBufferSize();
+
+// Clear the circular buffer
+void ClearErrors();
+
+#endif // ERRORS_HPP
