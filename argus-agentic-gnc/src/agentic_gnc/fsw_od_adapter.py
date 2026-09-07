@@ -32,5 +32,10 @@ def solve_with_fsw_python(batch: ODBatch) -> dict:
         landmark_uncertainties=sigmas,
         use_j2=False,
         use_drag=False,
+        ipopt_opts={
+            "ipopt.print_level": 0,
+            "print_time": 0,
+            "ipopt.sb": "yes",
+        },
         compute_covariance=False,
     )
