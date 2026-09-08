@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-from agentic_gnc.real_earthloc_env import EarthLocAction, RealEarthLocCaptureEnv
+from agentic_gnc.real_earthloc_env import (
+    EarthLocAction,
+    RealEarthLocCaptureEnv,
+    RealEarthLocConfig,
+)
+
 
 
 class ConservativeCaptureAgent:
@@ -18,7 +24,15 @@ class ConservativeCaptureAgent:
 
 
 def main() -> None:
-    environment = RealEarthLocCaptureEnv()
+    data_root = Path(os.environ["EARTHLOC_DATA_ROOT"])
+
+    environment = RealEarthLocCaptureEnv(
+        RealEarthLocConfig(
+            data_root=data_root,
+            checkpoint_path=data_root / "best_trained_model.pt",
+            device=os.environ.get("EARTHLOC_DEVICE", "cpu"),
+        )
+    )
     agent = ConservativeCaptureAgent()
     observation = environment.reset()
     total_reward = 0.0
