@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from agentic_gnc.navigation.contracts import GyroObservation, LandmarkObservation, ODBatch
+from agentic_gnc.navigation.navigation_measurement_contracts import GyroObservation, LandmarkObservation, ODBatch
 
 EARTH_RADIUS_M = 6_378_137.0
 EARTH_MU_M3_S2 = 3.986_004_418e14

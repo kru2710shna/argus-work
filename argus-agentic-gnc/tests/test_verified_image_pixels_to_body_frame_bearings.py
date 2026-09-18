@@ -1,6 +1,6 @@
 import numpy as np
 
-from agentic_gnc.navigation.verified_pixels_to_coordinate_frames.py import (
+from agentic_gnc.navigation.verified_image_pixels_to_body_frame_bearings import (
     CameraIntrinsics,
     camera_to_body_bearing,
     ecef_to_eci_position,

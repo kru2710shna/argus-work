@@ -3,7 +3,7 @@
 from pathlib import Path
 import sys
 
-from agentic_gnc.navigation.contracts import ODBatch
+from agentic_gnc.navigation.navigation_measurement_contracts import ODBatch
 
 
 def solve_with_fsw_python(batch: ODBatch) -> dict:

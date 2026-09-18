@@ -36,8 +36,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from agentic_gnc.navigation.contracts import LandmarkObservation
-from agentic_gnc.navigation.coordinate_frames import (
+from agentic_gnc.navigation.navigation_measurement_contracts import LandmarkObservation
+from agentic_gnc.navigation.verified_image_pixels_to_body_frame_bearings import (
     CameraIntrinsics,
     camera_to_body_bearing,
     ecef_to_eci_position,
@@ -73,6 +73,7 @@ class VerifiedVisualMatch:
     time_j2000_s: float
     frame_id: int
     query_pixel_uv: np.ndarray
+    camera_intrinsics: CameraIntrinsics
     landmark_ecef_m: np.ndarray
     rotation_camera_to_body: np.ndarray
     rotation_ecef_to_eci: np.ndarray
