@@ -1,32 +1,18 @@
-"""Camera and coordinate-frame utilities for navigation measurements.
+"""Convert verified image pixels into satellite body-frame bearings.
 
 WHAT THIS FILE DOES
 -------------------
-This is the first part of the Navigation Measurement Builder.
+This is the pixel-and-camera half of the Navigation Measurement Builder.
 
 It converts:
+
     LightGlue matched image pixel + camera calibration
         -> unit viewing ray in the camera frame
         -> unit viewing ray in the satellite body frame
 
-It also defines the safe handoff for:
-    known map/landmark position in ECEF
-        -> landmark position in ECI
+This body-frame ray is later combined with an ECI landmark position by:
 
-The final FSW-Payload landmark observation needs:
-
-    [timestamp,
-     body_bearing_x, body_bearing_y, body_bearing_z,
-     landmark_ECI_x, landmark_ECI_y, landmark_ECI_z]
-
-WHAT THIS FILE DOES NOT DO YET
-------------------------------
-- It does not run EarthLoc.
-- It does not run LightGlue.
-- It does not choose or verify map tiles.
-- It does not calculate ECEF-to-ECI rotation itself.
-  AstroPy/SPICE will provide that timestamp-specific rotation later.
-- It does not synchronize gyro/IMU data yet.
+    verified_visual_matches_to_fsw_landmark_observations.py
 
 FRAME CONVENTIONS
 -----------------
@@ -36,14 +22,7 @@ Camera frame:
     +Z = camera optical axis / looking direction
 
 Body frame:
-    Defined by the spacecraft camera-to-body calibration matrix.
-
-ECEF:
-    Earth-fixed Cartesian coordinates, in metres.
-
-ECI:
-    Inertial Cartesian coordinates, in metres, using the same convention
-    expected by FSW-Payload.
+    Defined by the calibrated camera-to-body rotation matrix.
 """
 
 from __future__ import annotations
@@ -54,21 +33,21 @@ import numpy as np
 
 
 def _vector(value: object, name: str) -> np.ndarray:
-    """Validate and return one finite three-dimensional vector."""
-    array = np.asarray(value, dtype=np.float64)
+    """Validate and return one finite 3D vector."""
 
-    # Navigation vectors must always be exactly [x, y, z].
-    if array.shape != (3,) or not np.isfinite(array).all():
+    vector = np.asarray(value, dtype=np.float64)
+
+    if vector.shape != (3,) or not np.isfinite(vector).all():
         raise ValueError(f"{name} must be a finite shape-(3,) vector")
 
-    return array
+    return vector
 
 
 def _unit(vector: np.ndarray, name: str) -> np.ndarray:
-    """Normalize a vector so that its length is exactly one."""
+    """Normalize a non-zero vector to unit length."""
+
     length = np.linalg.norm(vector)
 
-    # A zero-length vector has no physical direction.
     if length <= 0.0:
         raise ValueError(f"{name} must have non-zero length")
 
@@ -76,13 +55,8 @@ def _unit(vector: np.ndarray, name: str) -> np.ndarray:
 
 
 def _rotation(value: object, name: str) -> np.ndarray:
-    """Validate a proper 3D rotation matrix.
+    """Validate a proper 3D rotation matrix."""
 
-    A valid rotation matrix must:
-    - have shape (3, 3),
-    - be orthonormal: R.T @ R = identity,
-    - have determinant +1.
-    """
     matrix = np.asarray(value, dtype=np.float64)
 
     if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
@@ -99,14 +73,7 @@ def _rotation(value: object, name: str) -> np.ndarray:
 
 @dataclass(frozen=True)
 class CameraIntrinsics:
-    """Pinhole camera calibration values, measured in pixels.
-
-    fx_px, fy_px:
-        focal lengths in horizontal and vertical pixel units.
-
-    cx_px, cy_px:
-        principal point: the image pixel aligned with the optical axis.
-    """
+    """Pinhole-camera intrinsic calibration, measured in pixels."""
 
     fx_px: float
     fy_px: float
@@ -119,7 +86,6 @@ class CameraIntrinsics:
         if not all(np.isfinite(value) for value in values):
             raise ValueError("camera intrinsics must be finite")
 
-        # Focal length cannot be zero or negative.
         if self.fx_px <= 0.0 or self.fy_px <= 0.0:
             raise ValueError("fx_px and fy_px must be positive")
 
@@ -128,34 +94,27 @@ def pixel_to_camera_bearing(
     pixel_uv: object,
     intrinsics: CameraIntrinsics,
 ) -> np.ndarray:
-    """Convert one image pixel [u, v] into a unit camera-frame ray.
+    """Convert image pixel ``[u, v]`` to a unit camera-frame viewing ray.
 
-    Pinhole-camera projection is reversed:
-
-        x = (u - cx) / fx
-        y = (v - cy) / fy
-        ray_camera = normalize([x, y, 1])
-
-    The center pixel [cx, cy] therefore produces [0, 0, 1].
+    The center pixel ``[cx, cy]`` produces camera bearing ``[0, 0, 1]``.
     """
+
     pixel = np.asarray(pixel_uv, dtype=np.float64)
 
-    # A pixel is exactly [horizontal_u, vertical_v].
     if pixel.shape != (2,) or not np.isfinite(pixel).all():
         raise ValueError("pixel_uv must be a finite shape-(2,) vector")
 
     u_px, v_px = pixel
 
-    # Convert pixel coordinates into normalized camera coordinates.
     ray_camera = np.array(
         [
             (u_px - intrinsics.cx_px) / intrinsics.fx_px,
             (v_px - intrinsics.cy_px) / intrinsics.fy_px,
             1.0,
-        ]
+        ],
+        dtype=np.float64,
     )
 
-    # FSW expects a direction, so output must have unit length.
     return _unit(ray_camera, "camera ray")
 
 
@@ -163,47 +122,15 @@ def camera_to_body_bearing(
     bearing_camera: object,
     rotation_camera_to_body: object,
 ) -> np.ndarray:
-    """Rotate a camera-frame ray into the satellite body frame.
+    """Rotate a unit camera-frame ray into the satellite body frame."""
 
-    Input:
-        bearing_camera: unit ray from pixel_to_camera_bearing()
-        rotation_camera_to_body: calibrated 3x3 camera-to-body rotation
-
-    Output:
-        unit body-frame ray required by FSW-Payload.
-    """
-    ray_camera = _unit(_vector(bearing_camera, "bearing_camera"), "bearing_camera")
-    rotation = _rotation(rotation_camera_to_body, "rotation_camera_to_body")
+    ray_camera = _unit(
+        _vector(bearing_camera, "bearing_camera"),
+        "bearing_camera",
+    )
+    rotation = _rotation(
+        rotation_camera_to_body,
+        "rotation_camera_to_body",
+    )
 
     return _unit(rotation @ ray_camera, "body ray")
-
-
-def ecef_to_eci_position(
-    position_ecef_m: object,
-    rotation_ecef_to_eci: object,
-) -> np.ndarray:
-    """Convert a known Earth landmark from ECEF metres to ECI metres.
-
-    Input:
-        position_ecef_m:
-            known map-tile or landmark position in Earth-fixed coordinates.
-
-        rotation_ecef_to_eci:
-            timestamp-specific rotation from AstroPy/SPICE.
-
-    Output:
-        landmark position in the ECI frame required by FSW-Payload.
-
-    Important:
-        This function deliberately does not approximate Earth rotation.
-        We will connect AstroPy/SPICE in the next coordinate-integration layer.
-    """
-    position = _vector(position_ecef_m, "position_ecef_m")
-
-    # Earth-surface positions should be approximately Earth-radius scale.
-    if np.linalg.norm(position) < 6.0e6:
-        raise ValueError("position_ecef_m must be an Earth-scale position in metres")
-
-    rotation = _rotation(rotation_ecef_to_eci, "rotation_ecef_to_eci")
-
-    return rotation @ position

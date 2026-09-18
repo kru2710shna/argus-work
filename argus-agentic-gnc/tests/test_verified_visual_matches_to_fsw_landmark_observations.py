@@ -1,6 +1,8 @@
 import numpy as np
 
-from agentic_gnc.navigation.verified_image_pixels_to_body_frame_bearings import CameraIntrinsics
+from agentic_gnc.navigation.verified_image_pixels_to_body_frame_bearings import (
+    CameraIntrinsics,
+)
 from agentic_gnc.navigation.verified_visual_matches_to_fsw_landmark_observations import (
     VerifiedVisualMatch,
     build_landmark_observation,

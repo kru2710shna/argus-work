@@ -36,11 +36,23 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from agentic_gnc.navigation.known_map_locations_to_eci_landmarks import (
+    known_map_location_ecef_to_eci_landmark,
+)
+
+# from agentic_gnc.navigation.known_map_locations_to_eci_landmarks import (
+#     known_map_location_ecef_to_eci_landmark,
+# )
+
+# Add this import
+# from agentic_gnc.navigation.known_map_locations_to_eci_landmarks import (
+#     known_map_location_ecef_to_eci_landmark,
+# )
+
 from agentic_gnc.navigation.navigation_measurement_contracts import LandmarkObservation
 from agentic_gnc.navigation.verified_image_pixels_to_body_frame_bearings import (
     CameraIntrinsics,
     camera_to_body_bearing,
-    ecef_to_eci_position,
     pixel_to_camera_bearing,
 )
 
@@ -109,7 +121,7 @@ def build_landmark_observation(match: VerifiedVisualMatch) -> LandmarkObservatio
     )
 
     # Known map-feature position -> inertial ECI coordinates required by FSW.
-    landmark_eci_m = ecef_to_eci_position(
+    landmark_eci_m = known_map_location_ecef_to_eci_landmark(
         match.landmark_ecef_m,
         match.rotation_ecef_to_eci,
     )

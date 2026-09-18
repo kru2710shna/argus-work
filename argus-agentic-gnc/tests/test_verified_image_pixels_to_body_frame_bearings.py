@@ -3,7 +3,6 @@ import numpy as np
 from agentic_gnc.navigation.verified_image_pixels_to_body_frame_bearings import (
     CameraIntrinsics,
     camera_to_body_bearing,
-    ecef_to_eci_position,
     pixel_to_camera_bearing,
 )
 
@@ -28,11 +27,3 @@ def test_identity_camera_to_body_rotation() -> None:
     bearing = camera_to_body_bearing([0.0, 0.0, 1.0], np.eye(3))
 
     assert np.allclose(bearing, [0.0, 0.0, 1.0])
-
-
-def test_identity_ecef_to_eci_rotation() -> None:
-    earth_point_ecef_m = np.array([6_378_137.0, 0.0, 0.0])
-
-    earth_point_eci_m = ecef_to_eci_position(earth_point_ecef_m, np.eye(3))
-
-    assert np.allclose(earth_point_eci_m, earth_point_ecef_m)
