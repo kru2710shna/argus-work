@@ -6,6 +6,7 @@ venv/
 docs/
 cache/
 output/
+weights/
 *.faiss
 *.pt
 *.ckpt

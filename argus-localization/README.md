@@ -63,18 +63,23 @@ Pure numpy, no model. Reference tiles are nadir (looking straight down), so thei
 core/            GeoTile, TiePoint, LocalizationResult, MatchResult, PipelineConfig
                  Retriever / DescriptorIndex / Matcher protocols, LocalizationPipeline
 data_loading/    EarthLoc filename parsing, query/reference tile loaders
-retrievers/      EarthLocRetriever (v0 baseline, implemented), SmallRetriever (phase 2 target, stub)
+retrievers/      EarthLocRetriever (v0 baseline, implemented), SmallRetriever (phase 2 target, stub),
+                 RemoteCLIPRetriever and Qwen3VLEmbeddingRetriever (zero-shot comparisons), factory.py
 index/           FaissFlatIndex
 matchers/        SiftLightGlueMatcher
 georeference/    pixel -> lat/lon over a tile's four corners
 database/        ReferenceDatabase (embed, index, retrieve, save/load cache)
 integration/     to_batchopt_measurements, the one function that touches OD (stub, Phase 3)
 training/        train_retriever.py, phase 2 distillation stub, not run in v0
-scripts/         reproduce_earthloc_recall.py, evaluate.py, demo.py, build_coordinates_dataset.py
+scripts/         reproduce_earthloc_recall.py, evaluate.py, demo.py, build_coordinates_dataset.py,
+                 check_env.py, gpu_queue.py, run_zero_shot_alps.sh
+tests/           unittest suite: python -m unittest discover -s tests -t .
 docs/            design doc and implementation spec
 third_party/     vendored, gitignored, read-only copy of github.com/gmberton/EarthLoc
 cache/           gitignored. Cached FAISS indexes and tile metadata per region, db_<region>/
-output/          gitignored. Demo images and coordinates_<region>.json datasets
+                 (EarthLoc) or db_<retriever_id>_<region>/ (other retrievers)
+output/          gitignored. Demo images, coordinates_<region>.json datasets, results/*.json, gpu_logs/
+weights/         gitignored. Local RemoteCLIP / Qwen3-VL-Embedding weights (placed by hand)
 ```
 
 ## Current status
@@ -142,6 +147,35 @@ python scripts/build_coordinates_dataset.py --region Alps --limit 50
 ```
 
 All four scripts read `config.yaml` (pipeline/matcher/eval hyperparameters, checked into git) and `user_config.yaml` (machine-local paths, not meant to be identical across dev machines).
+
+## Swapping the retriever (zero-shot comparisons)
+
+`scripts/evaluate.py` builds its retriever through `retrievers/factory.py`, so the model is a flag, not a code change:
+
+| `--retriever` | Model | Descriptor | Needs |
+|---|---|---|---|
+| `earthloc` (default) | released EarthLoc checkpoint, ResNet50 + MixVPR | 4096-d | `third_party/EarthLoc`, `earthloc_checkpoint` |
+| `remoteclip` | RemoteCLIP image tower (`retrievers/remoteclip_retriever.py`) | 512 / 768 / 1024-d | `open_clip`, or `timm` for the ViTs; `RemoteCLIP-<model>.pt` in `remoteclip_checkpoint_dir` |
+| `qwen3vl_embedding` | Qwen3-VL-Embedding (`retrievers/qwen3vl_embedding_retriever.py`) | 2048-d (2B), MRL-truncatable | `transformers>=4.57`; the HF snapshot under `qwen3vl_embedding_dir` |
+
+Per-kind settings sit under `retriever.<kind>` in `config.yaml`; override one with `--retriever-opt key=value` (e.g. `--retriever-opt model_name=ViT-L-14`). Each retriever and settings combination gets its own DB cache, `cache/db_<retriever_id>_<region>`, so none of them can load another's descriptors. EarthLoc keeps the original `cache/db_<region>`. Every run writes `output/results/<region>_<retriever_id>_<time>.json` with the recalls and each query's first-hit rank, for paired comparisons.
+
+```
+python scripts/check_env.py                         # read-only preflight: packages, weights, data, GPUs
+python scripts/evaluate.py --retriever remoteclip --skip-matching --smoke   # ~minutes plumbing check
+scripts/run_zero_shot_alps.sh                       # earthloc, remoteclip, qwen3vl_embedding on Alps
+python -m unittest discover -s tests -t .           # unit tests, no weights or GPU needed
+```
+
+Neither new retriever has seen astronaut photos or these reference tiles, while EarthLoc was trained on those exact tiles (it never saw astronaut photos either). Their numbers are **zero-shot** and need labelling as such. Both wrappers were checked against their models' reference code on the real weights: RemoteCLIP against open_clip's `encode_image` (max abs diff < 1e-6, both backends), Qwen3-VL-Embedding against the official `scripts/qwen3_vl_embedding.py` helper (max abs diff < 5e-4, i.e. bf16 rounding). Nothing downloads weights: every path in `user_config.yaml` must already exist, and `run_zero_shot_alps.sh` runs with the Hugging Face offline switches on.
+
+## Running on the shared GPU workstation
+
+The workstation's rules are in `CLAUDE.md` at the repo root. In short: install and download nothing there, keep other people's processes untouched, and queue behind busy GPUs. The tooling follows them:
+
+- `scripts/check_env.py` only reads. It reports what's missing (so it can be requested from the admin) and exits non-zero when the chosen retriever can't run.
+- `scripts/gpu_queue.py -- <command>` waits until a GPU has no processes, ≤ 1 GiB used and ≤ 10% utilization, then runs the command there (pinned by GPU UUID, at nice 10). While it runs, it logs `nvidia-smi` to `output/gpu_logs/`. It only ever signals its own child. `--status` shows what it sees without running anything; `--require-all-idle` waits for every GPU to be free.
+- `scripts/run_zero_shot_alps.sh` chains the two for each retriever and skips any whose preflight fails.
 
 ## Current results
 

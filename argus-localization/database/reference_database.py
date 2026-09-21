@@ -14,6 +14,7 @@ only; this closes that gap. See docs/argus_localization_spec.md section 4.
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image
@@ -28,6 +29,10 @@ _ROTATION_SEP = "::rot"
 
 def _rotation_id(tile_id: str, degrees: int) -> str:
     return f"{tile_id}{_ROTATION_SEP}{degrees}"
+
+
+def _load_rgb(path: str) -> np.ndarray:
+    return np.array(Image.open(path).convert("RGB"))
 
 
 def _base_tile_id(rotation_id: str) -> str:
@@ -69,18 +74,36 @@ class ReferenceDatabase:
         self.tiles: dict[str, GeoTile] = {}
 
     def build(
-        self, tiles: list[GeoTile], batch_size: int = 64, rotations: tuple[int, ...] = DEFAULT_ROTATIONS
+        self,
+        tiles: list[GeoTile],
+        batch_size: int = 64,
+        rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
+        num_workers: int = 4,
     ) -> None:
+        """Embeds every tile at each rotation into the index.
+
+        JPEG decoding was the bottleneck here (the GPU sat mostly idle; see
+        README "Performance notes"), so the next batch decodes on num_workers
+        threads while the current one is on the GPU. PIL releases the GIL while
+        decoding. The order, and so the index contents, are unchanged.
+        """
         self.tiles = {tile.tile_id: tile for tile in tiles}
-        for start in tqdm(range(0, len(tiles), batch_size), desc="Embedding reference tiles"):
-            batch = tiles[start : start + batch_size]
-            images = [np.array(Image.open(tile.image_path).convert("RGB")) for tile in batch]
-            rot_ids = [
-                _rotation_id(tile.tile_id, degrees) for tile in batch for degrees in rotations
-            ]
-            rot_images = [np.rot90(image, k=degrees // 90) for image in images for degrees in rotations]
-            descriptors = self.retriever.embed_batch(rot_images)
-            self.index.add(rot_ids, descriptors)
+        batches = [tiles[start : start + batch_size] for start in range(0, len(tiles), batch_size)]
+        if not batches:
+            return
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            # pool.map submits every decode immediately and returns a lazy iterator.
+            next_images = pool.map(_load_rgb, [tile.image_path for tile in batches[0]])
+            for i, batch in enumerate(tqdm(batches, desc="Embedding reference tiles")):
+                images = list(next_images)
+                if i + 1 < len(batches):
+                    next_images = pool.map(_load_rgb, [tile.image_path for tile in batches[i + 1]])
+                rot_ids = [
+                    _rotation_id(tile.tile_id, degrees) for tile in batch for degrees in rotations
+                ]
+                rot_images = [np.rot90(image, k=degrees // 90) for image in images for degrees in rotations]
+                descriptors = self.retriever.embed_batch(rot_images)
+                self.index.add(rot_ids, descriptors)
 
     def get_tile(self, tile_id: str) -> GeoTile:
         return self.tiles[tile_id]

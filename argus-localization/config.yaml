@@ -11,10 +11,29 @@ pipeline:
 
 retriever:
   # v0: "earthloc" wraps the released ResNet50 + MixVPR checkpoint, for baseline plumbing only.
+  # Zero-shot comparisons: "remoteclip", "qwen3vl_embedding" (see retrievers/factory.py).
   # Phase 2 target: "small", a distilled EfficientNet-Lite/MobileNetV3 + GeM retriever.
+  # scripts/evaluate.py --retriever <kind> overrides this, --retriever-opt key=value overrides
+  # one setting below. Weight paths live in user_config.yaml.
   kind: earthloc
-  descriptor_dim: 512   # only used by kind "small"; "earthloc" is fixed at 4096 by the checkpoint
+  descriptor_dim: 512   # only used by kind "small"; every other kind reports its own dim
   head: gem
+
+  remoteclip:
+    model_name: ViT-B-32    # RN50 (1024-d) | ViT-B-32 (512-d) | ViT-L-14 (768-d)
+    image_size: 224          # the models' training size; ViTs can run larger (pos-embed interpolated)
+    quick_gelu: false        # RemoteCLIP's README builds plain GELU; its training activation is undocumented
+    resize_mode: squash      # squash = full field of view like earthloc; crop = open_clip's centre crop
+    backend: auto            # open_clip if installed, else timm (ViTs only)
+    max_batch: 128
+
+  qwen3vl_embedding:
+    model: Qwen3-VL-Embedding-2B   # directory name under qwen3vl_embedding_dir; -8B is ~3.4x the compute
+    image_size: 320          # multiple of 32; 320 px -> 100 visual tokens
+    dim: null                # null = full (2048 for 2B, 4096 for 8B); smaller = MRL truncation
+    instruction: null        # null = the model's default, "Represent the user's input."
+    batch_size: 32
+    attn_implementation: sdpa
 
 matcher:
   name: sift_lightglue
@@ -27,7 +46,7 @@ index:
 
 eval:
   iou_threshold: 0.2       # retrieval hit = retrieved tile footprint overlaps ground truth above this IoU
-  recall_k_values: [1, 5, 15]
+  recall_k_values: [1, 5, 10, 15, 100]   # 10 and 100 line up with the EarthLoc paper's tables
   db_year: 2021             # restrict the reference database to one year, matches the intersections file
   db_dist_km: 5000          # keep db tiles within this geodesic distance of the region center
   query_dist_km: 2500       # keep queries within this geodesic distance of the region center

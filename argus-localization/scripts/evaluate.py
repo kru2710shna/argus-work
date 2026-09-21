@@ -17,6 +17,7 @@ performance (docs/argus_localization_spec.md section 6, section 10).
 """
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -24,6 +25,8 @@ import random
 import statistics
 import sys
 import time
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import yaml
@@ -32,14 +35,17 @@ from shapely.geometry import Polygon
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.pipeline import LocalizationPipeline
-from core.types import GeoTile, PipelineConfig
+from core.interfaces import Retriever
+from core.types import GeoTile
 from data_loading.earthloc_loader import load_query_set, parse_geotile_filename
 from database.reference_database import ReferenceDatabase, dedup_search
-from georeference.georeferencer import Georeferencer
-from index.faiss_index import FaissFlatIndex
-from matchers.sift_lightglue_matcher import SiftLightGlueMatcher
-from retrievers.earthloc_retriever import EarthLocRetriever
+from index import FlatIndex
+from retrievers.factory import RETRIEVER_KINDS, build_retriever, retriever_id, retriever_settings
+
+if TYPE_CHECKING:
+    # Imported for real only in run_matching(), so retrieval-only runs don't
+    # need LightGlue installed.
+    from core.pipeline import LocalizationPipeline
 
 # Same six eval regions as EarthLoc's eval.py (center_lat, center_lon).
 REGIONS = {
@@ -136,13 +142,16 @@ def load_scoped_queries(
     ]
 
 
-def evaluate_retrieval(
+def rank_queries(
     db: ReferenceDatabase,
     queries: list[GeoTile],
-    k_values: list[int],
+    max_k: int,
     iou_threshold: float = 0.2,
     batch_size: int = 64,
-) -> tuple[dict[int, float], int]:
+) -> list[tuple[str, int | None]]:
+    """(query tile_id, 1-based rank of the first correct tile or None) for every
+    query that has a ground-truth positive. Recall@k for any k <= max_k follows
+    from these, and per-query ranks allow paired tests between retrievers."""
     db_tiles = list(db.tiles.values())
     db_bboxes = np.array([footprint_bbox(t) for t in db_tiles])
 
@@ -157,26 +166,42 @@ def evaluate_retrieval(
         else:
             logging.debug(f"Query {query.tile_id} has no positives, skipping (probably over the sea).")
 
-    max_k = max(k_values)
-    hits = {k: 0 for k in k_values}
+    ranks = []
     for start in range(0, len(scored_queries), batch_size):
         chunk = scored_queries[start : start + batch_size]
         images = [load_image_array(query.image_path) for query, _ in chunk]
         descriptors = db.retriever.embed_batch(images)
         for (query, positives_set), descriptor in zip(chunk, descriptors):
             retrieved = dedup_search(db.index, descriptor, max_k)
-            retrieved_ids = [tile_id for tile_id, _ in retrieved]
-            for k in k_values:
-                if any(tile_id in positives_set for tile_id in retrieved_ids[:k]):
-                    hits[k] += 1
-
-    num_evaluated = len(scored_queries)
-    if num_evaluated == 0:
-        return {k: 0.0 for k in k_values}, 0
-    return {k: 100.0 * hits[k] / num_evaluated for k in k_values}, num_evaluated
+            first_hit = next(
+                (rank for rank, (tile_id, _) in enumerate(retrieved, 1) if tile_id in positives_set),
+                None,
+            )
+            ranks.append((query.tile_id, first_hit))
+    return ranks
 
 
-def evaluate_matching(pipeline: LocalizationPipeline, queries: list[GeoTile]) -> dict:
+def recalls_from_ranks(ranks: list[tuple[str, int | None]], k_values: list[int]) -> dict[int, float]:
+    if not ranks:
+        return {k: 0.0 for k in k_values}
+    return {
+        k: 100.0 * sum(1 for _, rank in ranks if rank is not None and rank <= k) / len(ranks)
+        for k in k_values
+    }
+
+
+def evaluate_retrieval(
+    db: ReferenceDatabase,
+    queries: list[GeoTile],
+    k_values: list[int],
+    iou_threshold: float = 0.2,
+    batch_size: int = 64,
+) -> tuple[dict[int, float], int]:
+    ranks = rank_queries(db, queries, max(k_values), iou_threshold, batch_size)
+    return recalls_from_ranks(ranks, k_values), len(ranks)
+
+
+def evaluate_matching(pipeline: "LocalizationPipeline", queries: list[GeoTile]) -> dict:
     num_inliers_list = []
     num_fix = 0
     errors_km = []
@@ -201,12 +226,115 @@ def evaluate_matching(pipeline: LocalizationPipeline, queries: list[GeoTile]) ->
     }
 
 
+def parse_retriever_opts(opts: list[str]) -> dict:
+    """--retriever-opt key=value pairs; values are parsed as YAML (224 -> int, true -> bool)."""
+    overrides = {}
+    for opt in opts:
+        key, sep, value = opt.partition("=")
+        if not sep:
+            raise SystemExit(f"--retriever-opt expects key=value, got {opt!r}")
+        overrides[key.strip()] = yaml.safe_load(value)
+    return overrides
+
+
+def db_cache_dir(cache_root: str, kind: str, rid: str, region: str, smoke: bool) -> str:
+    region_slug = region.replace(" ", "_")
+    # EarthLoc keeps the original db_<region> name so existing caches stay valid.
+    name = f"db_{region_slug}" if kind == "earthloc" else f"db_{rid}_{region_slug}"
+    return os.path.join(cache_root, name + ("_smoke" if smoke else ""))
+
+
+def smoke_subset(
+    queries: list[GeoTile],
+    scope_db_tiles: Callable[[], list[GeoTile]],
+    iou_threshold: float,
+    seed: int,
+    num_queries: int = 50,
+    num_tiles: int = 500,
+) -> tuple[list[GeoTile], Callable[[], list[GeoTile]]]:
+    """A small query sample plus a DB of their true tiles and random distractors,
+    so a plumbing check exercises real retrieval hits in minutes. The tile list
+    is only computed when the (smoke) DB actually has to be built."""
+    rng = random.Random(seed)
+    queries = rng.sample(queries, min(num_queries, len(queries)))
+
+    def tiles() -> list[GeoTile]:
+        all_tiles = scope_db_tiles()
+        bboxes = np.array([footprint_bbox(t) for t in all_tiles])
+        keep = {
+            tile_id
+            for query in queries
+            for tile_id in find_positive_tile_ids(query, all_tiles, bboxes, iou_threshold)
+        }
+        chosen = [t for t in all_tiles if t.tile_id in keep]
+        others = [t for t in all_tiles if t.tile_id not in keep]
+        return chosen + rng.sample(others, max(0, min(num_tiles - len(chosen), len(others))))
+
+    return queries, tiles
+
+
+def load_or_build_db(
+    retriever: Retriever,
+    rid: str,
+    cache_dir: str,
+    rebuild: bool,
+    scope_db_tiles: Callable[[], list[GeoTile]],
+) -> tuple[ReferenceDatabase, float | None]:
+    """Returns the database and its build time in seconds (None when loaded from cache)."""
+    index = FlatIndex(retriever.descriptor_dim)
+    meta_path = os.path.join(cache_dir, "retriever.json")
+    if not rebuild and os.path.exists(os.path.join(cache_dir, "tiles.json")):
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                cached_rid = json.load(f)["retriever_id"]
+            if cached_rid != rid:
+                raise SystemExit(f"{cache_dir} was built by {cached_rid}, not {rid}; pass --rebuild-db")
+        logging.info(f"Loading cached reference database from {cache_dir}")
+        db = ReferenceDatabase.load(cache_dir, retriever, index)
+        if db.index.descriptor_dim != retriever.descriptor_dim:
+            raise SystemExit(
+                f"{cache_dir} holds {db.index.descriptor_dim}-d descriptors but {rid} makes "
+                f"{retriever.descriptor_dim}-d ones; pass --rebuild-db"
+            )
+        return db, None
+
+    db_tiles = scope_db_tiles()
+    logging.info(f"Embedding {len(db_tiles)} reference tiles x 4 rotations with {rid}")
+    db = ReferenceDatabase(retriever, index)
+    t0 = time.time()
+    db.build(db_tiles)
+    build_seconds = time.time() - t0
+    logging.info(
+        f"Built and embedded reference database in {build_seconds:.1f}s "
+        f"({4 * len(db_tiles) / max(build_seconds, 1e-9):.0f} img/s)"
+    )
+    db.save(cache_dir)
+    with open(meta_path, "w") as f:
+        json.dump({"retriever_id": rid, "num_tiles": len(db_tiles), "build_seconds": build_seconds}, f)
+    return db, build_seconds
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate the retrieve-then-match pipeline.")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--user-config", default="user_config.yaml")
     parser.add_argument("--region", default="Alps", choices=list(REGIONS.keys()))
+    parser.add_argument(
+        "--retriever", choices=RETRIEVER_KINDS, default=None,
+        help="retriever kind (default: retriever.kind in config.yaml)",
+    )
+    parser.add_argument(
+        "--retriever-opt", action="append", default=[], metavar="KEY=VALUE",
+        help="override one retriever.<kind> setting, e.g. model_name=ViT-L-14 (repeatable)",
+    )
     parser.add_argument("--rebuild-db", action="store_true", help="ignore any cached reference database")
+    parser.add_argument("--skip-matching", action="store_true", help="retrieval recall only, no SIFT+LightGlue")
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="plumbing check: 50 queries against their true tiles plus distractors (~500 tiles), "
+        "separate cache; recall numbers are meaningless",
+    )
+    parser.add_argument("--results-dir", default=None, help="default: <output_dir>/results from user_config.yaml")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -219,45 +347,93 @@ def main():
         user_config = yaml.safe_load(f)
 
     device = config.get("device", "cuda")
+    if device.startswith("cuda"):
+        import torch
+
+        if not torch.cuda.is_available():
+            logging.warning("CUDA is not available, falling back to CPU")
+            device = "cpu"
     center_lat, center_lon = REGIONS[args.region]
 
-    retriever = EarthLocRetriever(user_config["earthloc_checkpoint"], device=device)
-    index = FaissFlatIndex(retriever.descriptor_dim)
-    db = ReferenceDatabase(retriever, index)
-
-    cache_dir = os.path.join(user_config["cache_dir"], f"db_{args.region.replace(' ', '_')}")
-    if not args.rebuild_db and os.path.exists(os.path.join(cache_dir, "tiles.json")):
-        logging.info(f"Loading cached reference database from {cache_dir}")
-        db = ReferenceDatabase.load(cache_dir, retriever, index)
-    else:
-        logging.info(f"Scoping and building reference database for region {args.region}")
-        db_tiles = load_scoped_db_tiles(
-            user_config["database_dir"],
-            center_lat,
-            center_lon,
-            config["eval"]["db_year"],
-            config["eval"]["db_dist_km"],
-        )
-        logging.info(f"{len(db_tiles)} reference tiles within {config['eval']['db_dist_km']} km of {args.region}")
-        t0 = time.time()
-        db.build(db_tiles)
-        logging.info(f"Built and embedded reference database in {time.time() - t0:.1f}s")
-        db.save(cache_dir)
+    kind = args.retriever or config["retriever"]["kind"]
+    settings = retriever_settings(kind, config, parse_retriever_opts(args.retriever_opt))
+    rid = retriever_id(kind, settings)
+    logging.info(f"Retriever {rid}: {settings}")
+    retriever = build_retriever(kind, settings, user_config, device)
 
     queries = load_scoped_queries(
         user_config["queries_dir"], center_lat, center_lon, config["eval"]["query_dist_km"]
     )
     logging.info(f"{len(queries)} queries within {config['eval']['query_dist_km']} km of {args.region}")
 
+    def scope_db_tiles() -> list[GeoTile]:
+        tiles = load_scoped_db_tiles(
+            user_config["database_dir"],
+            center_lat,
+            center_lon,
+            config["eval"]["db_year"],
+            config["eval"]["db_dist_km"],
+        )
+        logging.info(f"{len(tiles)} reference tiles within {config['eval']['db_dist_km']} km of {args.region}")
+        return tiles
+
+    if args.smoke:
+        queries, scope_db_tiles = smoke_subset(
+            queries, scope_db_tiles, config["eval"]["iou_threshold"], args.seed
+        )
+
+    cache_dir = db_cache_dir(user_config["cache_dir"], kind, rid, args.region, args.smoke)
+    db, build_seconds = load_or_build_db(retriever, rid, cache_dir, args.rebuild_db, scope_db_tiles)
+
+    k_values = config["eval"]["recall_k_values"]
     logging.info("Evaluating retrieval...")
     t0 = time.time()
-    recalls, num_evaluated = evaluate_retrieval(
-        db, queries, config["eval"]["recall_k_values"], config["eval"]["iou_threshold"]
-    )
-    logging.info(f"Retrieval eval took {time.time() - t0:.1f}s over {num_evaluated} queries with ground truth")
+    ranks = rank_queries(db, queries, max(k_values), config["eval"]["iou_threshold"])
+    retrieval_seconds = time.time() - t0
+    recalls = recalls_from_ranks(ranks, k_values)
+    num_evaluated = len(ranks)
+    logging.info(f"Retrieval eval took {retrieval_seconds:.1f}s over {num_evaluated} queries with ground truth")
     recalls_str = ", ".join(f"R@{k}: {v:.1f}" for k, v in recalls.items())
-    print(f"\n=== Retrieval ({args.region}, {num_evaluated} queries with a ground-truth positive) ===")
+    print(f"\n=== Retrieval ({args.region}, {rid}, {num_evaluated} queries with a ground-truth positive) ===")
     print(recalls_str)
+
+    results = {
+        "region": args.region,
+        "retriever_kind": kind,
+        "retriever_id": rid,
+        "retriever_settings": settings,
+        "descriptor_dim": retriever.descriptor_dim,
+        "smoke": args.smoke,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "num_db_tiles": len(db.tiles),
+        "db_build_seconds": build_seconds,
+        "num_queries_scoped": len(queries),
+        "num_queries_evaluated": num_evaluated,
+        "retrieval_seconds": retrieval_seconds,
+        "recalls": {f"R@{k}": v for k, v in recalls.items()},
+        "first_hit_rank": dict(ranks),
+    }
+
+    if not args.skip_matching:
+        results["matching"] = run_matching(db, queries, config, device, args.region)
+
+    results_dir = args.results_dir or os.path.join(user_config["output_dir"], "results")
+    os.makedirs(results_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    suffix = "_smoke" if args.smoke else ""
+    results_path = os.path.join(results_dir, f"{args.region.replace(' ', '_')}_{rid}{suffix}_{stamp}.json")
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    logging.info(f"Wrote {results_path}")
+
+
+def run_matching(
+    db: ReferenceDatabase, queries: list[GeoTile], config: dict, device: str, region: str
+) -> dict:
+    from core.pipeline import LocalizationPipeline
+    from core.types import PipelineConfig
+    from georeference.georeferencer import Georeferencer
+    from matchers.sift_lightglue_matcher import SiftLightGlueMatcher
 
     matcher = SiftLightGlueMatcher(
         max_num_keypoints=config["matcher"]["max_num_keypoints"],
@@ -279,11 +455,12 @@ def main():
     matching_stats = evaluate_matching(pipeline, matching_queries)
     logging.info(f"Matching eval took {time.time() - t0:.1f}s")
 
-    print(f"\n=== Matching ({args.region}, {matching_stats['num_queries']} queries) ===")
+    print(f"\n=== Matching ({region}, {matching_stats['num_queries']} queries) ===")
     print(f"mean best-candidate num_inliers: {matching_stats['mean_num_inliers']:.1f}")
     print(f"fix rate (num_inliers >= {config['pipeline']['min_inliers']}): {matching_stats['fix_rate']:.1f}%")
     median_error = matching_stats["median_localization_error_km"]
     print(f"median localization error: {median_error:.1f} km" if median_error is not None else "median localization error: n/a (no fixes)")
+    return matching_stats
 
 
 if __name__ == "__main__":
