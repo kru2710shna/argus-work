@@ -13,6 +13,7 @@ import importlib
 import os
 import subprocess
 import sys
+import zipfile
 
 import yaml
 
@@ -119,7 +120,11 @@ def check_remoteclip(settings: dict, user_config: dict) -> bool:
                 arch or "RN50 needs open_clip",
             )
     path = os.path.join(user_config.get("remoteclip_checkpoint_dir", ""), checkpoint_filename(settings["model_name"]))
-    return ok & check("checkpoint", os.path.exists(path), path)
+    # torch.save files are zip archives, and a cut-off copy loses the zip's
+    # end-of-archive record, so this catches an interrupted transfer cheaply.
+    complete = os.path.exists(path) and zipfile.is_zipfile(path)
+    detail = path if complete or not os.path.exists(path) else f"{path} (incomplete: not a valid zip, re-copy it)"
+    return ok & check("checkpoint", complete, detail)
 
 
 def check_qwen3vl_embedding(settings: dict, user_config: dict) -> bool:
