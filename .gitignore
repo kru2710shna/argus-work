@@ -3,3 +3,10 @@ venv/
 __pycache__/
 *.py[cod]
 *_core.txt
+
+# Local development files
+.venv/
+.vscode/
+__pycache__/
+*.py[cod]
+.DS_Store
