@@ -48,6 +48,8 @@ eval:
   iou_threshold: 0.2       # retrieval hit = retrieved tile footprint overlaps ground truth above this IoU
   recall_k_values: [1, 5, 10, 15, 100]   # 10 and 100 line up with the EarthLoc paper's tables
   db_year: 2021             # restrict the reference database to one year, matches the intersections file
+  db_zooms: [9, 10, 11]     # database folders are <year>_<zoom>; 9-11 is the EarthLoc paper's DB and gives the
+                            # README's 52,951-tile Alps baseline. The folder also holds zooms 8 and 12 (4x the tiles)
   db_dist_km: 5000          # keep db tiles within this geodesic distance of the region center
   query_dist_km: 2500       # keep queries within this geodesic distance of the region center
   max_matching_queries: 50  # matching (retrieval + SIFT-LightGlue) is much slower than retrieval alone,

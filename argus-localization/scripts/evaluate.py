@@ -113,12 +113,24 @@ def load_image_array(path: str) -> np.ndarray:
 
 
 def load_scoped_db_tiles(
-    database_dir: str, center_lat: float, center_lon: float, year: int, dist_km: float
+    database_dir: str,
+    center_lat: float,
+    center_lon: float,
+    year: int,
+    dist_km: float,
+    zooms: list[int] | None = None,
 ) -> list[GeoTile]:
+    """Tiles of one year within dist_km of a center. The database folders are
+    named <year>_<zoom> (e.g. 2021_11 is zoom 11, not November), and zooms
+    keeps only those levels; None keeps every folder of that year."""
     import glob
 
     month_dirs = sorted(
-        d for d in os.listdir(database_dir) if d.startswith(f"{year}_") and os.path.isdir(os.path.join(database_dir, d))
+        d
+        for d in os.listdir(database_dir)
+        if d.startswith(f"{year}_")
+        and os.path.isdir(os.path.join(database_dir, d))
+        and (zooms is None or d.split("_", 1)[1] in {f"{z:02d}" for z in zooms})
     )
     paths = []
     for month_dir in month_dirs:
@@ -279,16 +291,24 @@ def load_or_build_db(
     cache_dir: str,
     rebuild: bool,
     scope_db_tiles: Callable[[], list[GeoTile]],
+    scope: dict | None = None,
 ) -> tuple[ReferenceDatabase, float | None]:
-    """Returns the database and its build time in seconds (None when loaded from cache)."""
+    """Returns the database and its build time in seconds (None when loaded from cache).
+
+    scope (e.g. year, zooms, radius) is saved with the cache, and a cache built
+    under a different scope is refused rather than silently reused."""
     index = FlatIndex(retriever.descriptor_dim)
     meta_path = os.path.join(cache_dir, "retriever.json")
     if not rebuild and os.path.exists(os.path.join(cache_dir, "tiles.json")):
         if os.path.exists(meta_path):
             with open(meta_path) as f:
-                cached_rid = json.load(f)["retriever_id"]
-            if cached_rid != rid:
-                raise SystemExit(f"{cache_dir} was built by {cached_rid}, not {rid}; pass --rebuild-db")
+                meta = json.load(f)
+            if meta["retriever_id"] != rid:
+                raise SystemExit(f"{cache_dir} was built by {meta['retriever_id']}, not {rid}; pass --rebuild-db")
+            if meta.get("scope") != scope:
+                raise SystemExit(
+                    f"{cache_dir} was built for scope {meta.get('scope')}, not {scope}; pass --rebuild-db"
+                )
         logging.info(f"Loading cached reference database from {cache_dir}")
         db = ReferenceDatabase.load(cache_dir, retriever, index)
         if db.index.descriptor_dim != retriever.descriptor_dim:
@@ -310,7 +330,9 @@ def load_or_build_db(
     )
     db.save(cache_dir)
     with open(meta_path, "w") as f:
-        json.dump({"retriever_id": rid, "num_tiles": len(db_tiles), "build_seconds": build_seconds}, f)
+        json.dump(
+            {"retriever_id": rid, "scope": scope, "num_tiles": len(db_tiles), "build_seconds": build_seconds}, f
+        )
     return db, build_seconds
 
 
@@ -373,6 +395,7 @@ def main():
             center_lon,
             config["eval"]["db_year"],
             config["eval"]["db_dist_km"],
+            zooms=config["eval"].get("db_zooms"),
         )
         logging.info(f"{len(tiles)} reference tiles within {config['eval']['db_dist_km']} km of {args.region}")
         return tiles
@@ -383,7 +406,13 @@ def main():
         )
 
     cache_dir = db_cache_dir(user_config["cache_dir"], kind, rid, args.region, args.smoke)
-    db, build_seconds = load_or_build_db(retriever, rid, cache_dir, args.rebuild_db, scope_db_tiles)
+    scope = {
+        "db_year": config["eval"]["db_year"],
+        "db_zooms": config["eval"].get("db_zooms"),
+        "db_dist_km": config["eval"]["db_dist_km"],
+        "smoke_seed": args.seed if args.smoke else None,
+    }
+    db, build_seconds = load_or_build_db(retriever, rid, cache_dir, args.rebuild_db, scope_db_tiles, scope)
 
     k_values = config["eval"]["recall_k_values"]
     logging.info("Evaluating retrieval...")
@@ -405,6 +434,7 @@ def main():
         "descriptor_dim": retriever.descriptor_dim,
         "smoke": args.smoke,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "db_scope": scope,
         "num_db_tiles": len(db.tiles),
         "db_build_seconds": build_seconds,
         "num_queries_scoped": len(queries),

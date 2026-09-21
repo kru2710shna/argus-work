@@ -18,6 +18,8 @@ from index.numpy_index import NumpyFlatIndex
 from retrievers.factory import build_retriever, retriever_id, retriever_settings
 from scripts.evaluate import (
     db_cache_dir,
+    load_or_build_db,
+    load_scoped_db_tiles,
     parse_retriever_opts,
     recalls_from_ranks,
     smoke_subset,
@@ -114,6 +116,18 @@ class EvalHelpersTest(unittest.TestCase):
             os.path.join("cache", "db_remoteclip-ViT-B-32-224-squash_Toshka_Lakes_smoke"),
         )
 
+    def test_scoping_reads_year_zoom_folders(self):
+        # Folders are <year>_<zoom>; zooms=None keeps every folder of the year.
+        with tempfile.TemporaryDirectory() as tmp:
+            for folder, zoom in (("2021_09", "09"), ("2021_11", "11"), ("2021_12", "12"), ("2020_11", "11")):
+                os.makedirs(os.path.join(tmp, folder, "45_10"))
+                name = f"@44@9@46@9@46@11@44@11@{zoom}_1_{folder}@{folder}@45@10@1000@0@.jpg"
+                open(os.path.join(tmp, folder, "45_10", name), "w").close()
+            ids = lambda tiles: sorted(t.tile_id.split("@")[0] for t in tiles)
+            self.assertEqual(ids(load_scoped_db_tiles(tmp, 45, 10, 2021, 100)), ["09_1_2021_09", "11_1_2021_11", "12_1_2021_12"])
+            self.assertEqual(ids(load_scoped_db_tiles(tmp, 45, 10, 2021, 100, zooms=[9, 10, 11])), ["09_1_2021_09", "11_1_2021_11"])
+            self.assertEqual(load_scoped_db_tiles(tmp, 0, -120, 2021, 100, zooms=[9, 10, 11]), [])
+
     def test_smoke_subset_keeps_every_sampled_querys_true_tiles(self):
         tiles = [square_tile(f"t{i}", lat=float(i), lon=0.0, half=0.5) for i in range(40)]
         queries = [square_tile(f"q{i}", lat=float(i), lon=0.0, half=0.5) for i in range(0, 40, 2)]
@@ -156,6 +170,24 @@ class ReferenceDatabaseBuildTest(unittest.TestCase):
             query = np.array(Image.open(tiles[7].image_path).convert("RGB"))
             best_tile, _ = dedup_search(db.index, _MeanColorRetriever().embed(query), 1)[0]
             self.assertEqual(best_tile, "t7")
+
+
+class DbCacheScopeTest(unittest.TestCase):
+    def test_cache_built_under_another_scope_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t0.png")
+            Image.fromarray(np.full((8, 8, 3), 100, dtype=np.uint8)).save(path)
+            tiles = lambda: [GeoTile("t0", path, np.zeros((4, 2)))]
+            cache = os.path.join(tmp, "cache")
+            scope = {"db_year": 2021, "db_zooms": [9, 10, 11]}
+            _, built = load_or_build_db(_MeanColorRetriever(), "fake", cache, False, tiles, scope)
+            self.assertIsNotNone(built)
+            _, reloaded = load_or_build_db(_MeanColorRetriever(), "fake", cache, False, tiles, scope)
+            self.assertIsNone(reloaded)  # same scope: served from cache
+            with self.assertRaises(SystemExit):
+                load_or_build_db(_MeanColorRetriever(), "fake", cache, False, tiles, {**scope, "db_zooms": None})
+            with self.assertRaises(SystemExit):
+                load_or_build_db(_MeanColorRetriever(), "other", cache, False, tiles, scope)
 
 
 class NumpyFlatIndexTest(unittest.TestCase):
