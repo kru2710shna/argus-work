@@ -211,20 +211,6 @@ R@1 56.8 is now 97% of the EarthLoc reproduction above (58.4), using our own `Fa
 
 Rotation TTA costs what the paper says it costs: 4x build time (Alps: ~270s -> ~1070s to embed 52,951 tiles) and 4x index memory (~3.5 GB of descriptor vectors for Alps alone, at 4096-dim x 4 rotations x 52,951 tiles).
 
-### RemoteCLIP zero-shot (`evaluate.py --retriever remoteclip --skip-matching`, Alps region)
-
-Run 2026-09-21 on the shared GPU workstation (one RTX 4090), commit `fa74bd4`, retrieval only.
-
-- **Model:** RemoteCLIP ViT-B-32 image tower ([ChenDelong1999/RemoteCLIP](https://github.com/ChenDelong1999/RemoteCLIP), HF `chendelong/RemoteCLIP`). **87.85M parameters** used for retrieval (151.28M in the full image+text checkpoint), 512-d embedding, 224x224 input. EarthLoc, for comparison, has about 27.6M.
-- **Dataset:** the same Alps set as the EarthLoc baseline above. The queries are 2,393 astronaut photos from EarthLoc's query set, taken with the ISS within 2,500 km of (45N, 10E). The database is 52,951 EarthLoc Sentinel-2 tiles from 2021, zooms 9-11, within 5,000 km, each embedded at 4 rotations. A retrieved tile counts as correct at footprint IoU >= 0.2.
-
-| Alps, same harness | R@1 | R@5 | R@10 | R@15 | R@100 |
-|---|---|---|---|---|---|
-| RemoteCLIP ViT-B-32, zero-shot | 2.9 | 7.7 | 10.2 | 13.2 | 34.4 |
-| EarthLoc (above) | 56.8 | 69.7 | -- | 76.4 | -- |
-
-**Summary:** zero-shot, RemoteCLIP is not a usable replacement. For 66% of queries (1,571 of 2,393), no correct tile appears anywhere in the top 100. It was trained on high-resolution aerial, satellite and UAV images (about 0.05 to a few m/px, captioned objects such as buildings and ships). It has never seen astronaut photos or tiles like these (75-300 m/px, about 100 km across). EarthLoc was trained on these exact reference tiles, though never on the astronaut photos either. The low score comes from the model, not the pipeline: rotated database tiles retrieve themselves at rank 1 (20/20). The embeddings also match open_clip's `encode_image` to within about 1e-6. Raw results, with each query's first-hit rank, are in `output/results/Alps_remoteclip-ViT-B-32-224-squash_*.json` on the machine that ran them.
-
 ### Coordinates dataset export (`build_coordinates_dataset.py`, all 6 EarthLoc regions, 50 frames each)
 
 With rotation TTA (current):
