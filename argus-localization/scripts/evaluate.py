@@ -40,7 +40,13 @@ from core.types import GeoTile
 from data_loading.earthloc_loader import load_query_set, parse_geotile_filename
 from database.reference_database import ReferenceDatabase, dedup_search
 from index import FlatIndex
-from retrievers.factory import RETRIEVER_KINDS, build_retriever, retriever_id, retriever_settings
+from retrievers.factory import (
+    RETRIEVER_KINDS,
+    build_retriever,
+    parse_retriever_opts,
+    retriever_id,
+    retriever_settings,
+)
 
 if TYPE_CHECKING:
     # Imported for real only in run_matching(), so retrieval-only runs don't
@@ -236,17 +242,6 @@ def evaluate_matching(pipeline: "LocalizationPipeline", queries: list[GeoTile]) 
         "fix_rate": 100.0 * num_fix / len(queries) if queries else 0.0,
         "median_localization_error_km": statistics.median(errors_km) if errors_km else None,
     }
-
-
-def parse_retriever_opts(opts: list[str]) -> dict:
-    """--retriever-opt key=value pairs; values are parsed as YAML (224 -> int, true -> bool)."""
-    overrides = {}
-    for opt in opts:
-        key, sep, value = opt.partition("=")
-        if not sep:
-            raise SystemExit(f"--retriever-opt expects key=value, got {opt!r}")
-        overrides[key.strip()] = yaml.safe_load(value)
-    return overrides
 
 
 def db_cache_dir(cache_root: str, kind: str, rid: str, region: str, smoke: bool) -> str:

@@ -1,8 +1,9 @@
 """Zero-shot baseline: the RemoteCLIP image tower as a Retriever.
 
 RemoteCLIP (arXiv 2306.11029, https://github.com/ChenDelong1999/RemoteCLIP) is
-OpenAI CLIP continually pretrained on remote-sensing image-text pairs (sub-metre
-aerial/UAV imagery, not 75-300 m/px tiles). Only the image tower is used:
+OpenAI CLIP continually pretrained on remote-sensing image-text pairs
+(high-resolution aerial, satellite and UAV imagery, roughly 0.05 to a few m/px,
+not 75-300 m/px tiles). Only the image tower is used:
 image -> L2-normalized embedding, the same contract as EarthLocRetriever. It has
 never seen astronaut photos or this tile database, so its recall is zero-shot,
 while EarthLoc was trained on these exact reference tiles.
@@ -45,6 +46,10 @@ def checkpoint_filename(model_name: str) -> str:
     return f"RemoteCLIP-{model_name}.pt"
 
 
+def timm_arch(model_name: str, quick_gelu: bool) -> str:
+    return f"{_TIMM_ARCHS[model_name]}{'_quickgelu' if quick_gelu else ''}_224"
+
+
 def _load_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     for key in ("state_dict", "model"):
@@ -76,9 +81,11 @@ def _build_timm_visual(
     import timm
     from timm.models.vision_transformer import checkpoint_filter_fn
 
-    arch = f"{_TIMM_ARCHS[model_name]}{'_quickgelu' if quick_gelu else ''}_224"
     model = timm.create_model(
-        arch, pretrained=False, num_classes=EMBED_DIMS[model_name], img_size=image_size
+        timm_arch(model_name, quick_gelu),
+        pretrained=False,
+        num_classes=EMBED_DIMS[model_name],
+        img_size=image_size,
     )
     # Renames visual.* keys to timm's, turns proj into head.weight, and resamples
     # pos_embed when image_size != 224.

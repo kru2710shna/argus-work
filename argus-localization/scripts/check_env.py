@@ -19,7 +19,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from retrievers.factory import RETRIEVER_KINDS, retriever_settings  # noqa: E402
+from retrievers.factory import RETRIEVER_KINDS, parse_retriever_opts, retriever_settings  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MISSING_HINT = "missing: ask the workstation admin (do not pip install on the shared workstation)"
@@ -95,7 +95,7 @@ def check_earthloc(settings: dict, user_config: dict) -> bool:
 
 
 def check_remoteclip(settings: dict, user_config: dict) -> bool:
-    from retrievers.remoteclip_retriever import checkpoint_filename
+    from retrievers.remoteclip_retriever import _TIMM_ARCHS, checkpoint_filename, timm_arch
 
     open_clip_version = module_version("open_clip")
     timm_version = module_version("timm")
@@ -111,9 +111,8 @@ def check_remoteclip(settings: dict, user_config: dict) -> bool:
         if timm_version:
             import timm
 
-            arch = {"ViT-B-32": "vit_base_patch32_clip_224", "ViT-L-14": "vit_large_patch14_clip_224"}.get(
-                settings["model_name"]
-            )
+            supported = settings["model_name"] in _TIMM_ARCHS
+            arch = timm_arch(settings["model_name"], settings["quick_gelu"]) if supported else None
             ok &= check(
                 f"timm arch for {settings['model_name']}",
                 arch is not None and arch in timm.list_models(),
@@ -156,7 +155,14 @@ def main() -> int:
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--user-config", default="user_config.yaml")
     parser.add_argument("--retriever", choices=RETRIEVER_KINDS, default=None, help="default: report on all")
+    parser.add_argument(
+        "--retriever-opt", action="append", default=[], metavar="KEY=VALUE",
+        help="same overrides as evaluate.py, so the exact variant's checkpoint and arch are checked",
+    )
     args = parser.parse_args()
+    overrides = parse_retriever_opts(args.retriever_opt)
+    if overrides and not args.retriever:
+        parser.error("--retriever-opt needs --retriever")
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -167,7 +173,7 @@ def main() -> int:
     ready = {}
     for kind in [args.retriever] if args.retriever else RETRIEVER_KINDS:
         print(f"Retriever: {kind}")
-        ready[kind] = CHECKS[kind](retriever_settings(kind, config), user_config)
+        ready[kind] = CHECKS[kind](retriever_settings(kind, config, overrides), user_config)
 
     print("Summary: " + ", ".join(f"{k} {'ready' if v else 'NOT ready'}" for k, v in ready.items()))
     return 0 if ok and all(ready.values()) else 1

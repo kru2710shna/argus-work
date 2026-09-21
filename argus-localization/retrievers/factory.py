@@ -14,6 +14,8 @@ import hashlib
 import os
 from typing import Any
 
+import yaml
+
 from core.interfaces import Retriever
 
 RETRIEVER_KINDS = ("earthloc", "remoteclip", "qwen3vl_embedding")
@@ -37,6 +39,17 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
         "attn_implementation": "sdpa",
     },
 }
+
+
+def parse_retriever_opts(opts: list[str]) -> dict[str, Any]:
+    """--retriever-opt key=value pairs; values are parsed as YAML (224 -> int, true -> bool)."""
+    overrides = {}
+    for opt in opts:
+        key, sep, value = opt.partition("=")
+        if not sep:
+            raise SystemExit(f"--retriever-opt expects key=value, got {opt!r}")
+        overrides[key.strip()] = yaml.safe_load(value)
+    return overrides
 
 
 def retriever_settings(
