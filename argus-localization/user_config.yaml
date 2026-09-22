@@ -9,8 +9,8 @@ earthloc_checkpoint: /mnt/sdc1/astroloc/data/best_trained_model.pt
 queries_intersections_path: /mnt/sdc1/astroloc/data/queries_intersections_with_db_2021.pt
 
 # Local weights for the zero-shot retriever comparisons. Nothing downloads these
-# automatically; put them in place by hand (on the shared GPU workstation, only
-# with the admin's OK, see README "Running on the shared GPU workstation").
+# automatically; put them in place by hand (on the shared GPU workstation,
+# follow the model-weights rule in the repo-root CLAUDE.md).
 remoteclip_checkpoint_dir: ./weights/RemoteCLIP        # holds RemoteCLIP-{RN50,ViT-B-32,ViT-L-14}.pt
 qwen3vl_embedding_dir: ./weights                        # holds Qwen3-VL-Embedding-2B/ (and -8B/) HF snapshots
 
