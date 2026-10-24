@@ -1,0 +1,33 @@
+{
+  "name": "synthetic_first_ground_imaging_decision",
+  "source": "synthetic",
+  "now_unix_s": 1791416400,
+  "telemetry": {
+    "battery_pct": 74,
+    "storage_free_mb": 8000,
+    "experiment_queue_depth": 0
+  },
+  "demo_policy": {
+    "min_battery_pct": 25,
+    "min_storage_free_mb": 500,
+    "min_land_fraction": 0.6,
+    "max_cloud_fraction": 0.4
+  },
+  "windows": [
+    {
+      "id": "ocean_early", "ts_unix_s": 1791417000, "camera_bit_flag": 1,
+      "duration_s": 10, "capture_rate_hz": 1,
+      "land_fraction": 0.1, "cloud_fraction": 0.05
+    },
+    {
+      "id": "land_cloudier", "ts_unix_s": 1791417600, "camera_bit_flag": 1,
+      "duration_s": 10, "capture_rate_hz": 1,
+      "land_fraction": 0.9, "cloud_fraction": 0.35
+    },
+    {
+      "id": "land_clearer", "ts_unix_s": 1791418200, "camera_bit_flag": 1,
+      "duration_s": 10, "capture_rate_hz": 1,
+      "land_fraction": 0.75, "cloud_fraction": 0.1
+    }
+  ]
+}
